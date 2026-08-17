@@ -38,3 +38,8 @@ Thumbs.db
 # Tool caches
 .omo/
 .codegraph/
+
+# admin-ui (Vue 3 + Vite) - build.rs runs `npm run build` automatically;
+# dist/ is a generated artifact, not source.
+admin-ui/node_modules/
+admin-ui/dist/

@@ -14,8 +14,15 @@ endpoint.
 
 ```bash
 printf 'ADMIN_TOKEN=%s\n' "$(openssl rand -hex 32)" > .env
+npm install --prefix admin-ui   # one-time: installs the admin console's build tooling
 cargo run --release
 ```
+
+`cargo build`/`cargo run` runs `npm run build` in [`admin-ui/`](admin-ui) automatically
+(via `build.rs`) and embeds the compiled output into the binary, so the
+server stays a single deployable artifact - `npm install` is the only
+one-time setup step. See [`admin-ui/README.md`](admin-ui/README.md) for
+that app's own dev workflow.
 
 Env vars:
 
@@ -30,8 +37,9 @@ already present in the process environment take precedence.
 
 ## API
 
-Open `/` in a browser for the built-in test console. It can register devices,
-copy the one-time device token, and manage alarms and todos using `ADMIN_TOKEN`.
+Open `/` in a browser for the admin console (`admin-ui/`, a small Vue 3
+app embedded into the binary). It can register devices, copy the
+one-time device token, and manage alarms and todos using `ADMIN_TOKEN`.
 
 - `GET /health` - unauthenticated liveness check.
 - `GET /api/sync` - device-facing, `Authorization: Bearer <device_token>`,

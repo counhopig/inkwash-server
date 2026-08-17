@@ -9,15 +9,25 @@
 //!   `register_device` issued.
 
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::{Html, IntoResponse, Response};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
+use rust_embed::RustEmbed;
 
 use crate::db::{self, Db};
 use crate::models::{
     DeviceSyncRequest, RegisterDeviceRequest, SyncResponse, UpsertAlarmRequest, UpsertTodoRequest,
 };
+
+/// The built admin console (`admin-ui/`, a small Vue 3 + Vite app - see
+/// that directory's README) embedded into the binary at compile time, so
+/// the server stays a single deployable artifact with no extra static
+/// files to ship alongside it. Run `npm run build` in `admin-ui/` before
+/// `cargo build`/`cargo run` to regenerate `admin-ui/dist/`.
+#[derive(RustEmbed)]
+#[folder = "admin-ui/dist/"]
+struct AdminAssets;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -27,7 +37,8 @@ pub struct AppState {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/", get(admin_page))
+        .route("/", get(admin_index))
+        .route("/assets/*path", get(admin_asset))
         .route("/health", get(health))
         .route("/api/sync", get(device_sync).post(device_push_sync))
         .route("/api/devices", post(register_device).get(list_devices))
@@ -51,8 +62,24 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn admin_page() -> Html<&'static str> {
-    Html(include_str!("admin.html"))
+async fn admin_index() -> Response {
+    serve_admin_asset("index.html")
+}
+
+async fn admin_asset(Path(path): Path<String>) -> Response {
+    // Embedded keys are relative to admin-ui/dist/ (e.g. "assets/index-*.js"),
+    // but the wildcard route only captures what follows "/assets/".
+    serve_admin_asset(&format!("assets/{path}"))
+}
+
+fn serve_admin_asset(path: &str) -> Response {
+    match AdminAssets::get(path) {
+        Some(file) => {
+            let mime = file.metadata.mimetype();
+            ([(header::CONTENT_TYPE, mime)], file.data).into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
 }
 
 async fn health() -> impl IntoResponse {
