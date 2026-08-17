@@ -12,7 +12,9 @@ use rand::distributions::Alphanumeric;
 use rand::Rng;
 use rusqlite::{params, Connection};
 
-use crate::models::{Alarm, Device, Repeat, Todo, UpsertAlarmRequest, UpsertTodoRequest};
+use crate::models::{
+    Alarm, Device, DeviceSyncRequest, Repeat, Todo, UpsertAlarmRequest, UpsertTodoRequest,
+};
 
 pub type Db = Arc<Mutex<Connection>>;
 
@@ -127,6 +129,37 @@ fn bump_version(conn: &Connection, device_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Applies only the fields the physical device is allowed to edit. Unknown
+/// IDs are ignored so stale device caches cannot recreate content deleted by
+/// Desktop/Server. Returns the resulting device version.
+pub fn merge_device_state(db: &Db, device_id: i64, state: &DeviceSyncRequest) -> Result<i64> {
+    let mut conn = db.lock().unwrap();
+    let tx = conn.transaction()?;
+    let mut changed = false;
+    for alarm in &state.alarms {
+        changed |= tx.execute(
+            "UPDATE alarms SET enabled = ?3 WHERE device_id = ?1 AND local_id = ?2 AND enabled != ?3",
+            params![device_id, alarm.id, alarm.enabled],
+        )? > 0;
+    }
+    for todo in &state.todos {
+        changed |= tx.execute(
+            "UPDATE todos SET done = ?3 WHERE device_id = ?1 AND local_id = ?2 AND done != ?3",
+            params![device_id, todo.id, todo.done],
+        )? > 0;
+    }
+    if changed {
+        bump_version(&tx, device_id)?;
+    }
+    let version = tx.query_row(
+        "SELECT version FROM devices WHERE id = ?1",
+        params![device_id],
+        |row| row.get(0),
+    )?;
+    tx.commit()?;
+    Ok(version)
+}
+
 pub fn list_alarms(db: &Db, device_id: i64) -> Result<Vec<Alarm>> {
     let conn = db.lock().unwrap();
     let mut stmt = conn.prepare(
@@ -160,8 +193,8 @@ pub fn list_alarms(db: &Db, device_id: i64) -> Result<Vec<Alarm>> {
 
 pub fn list_todos(db: &Db, device_id: i64) -> Result<Vec<Todo>> {
     let conn = db.lock().unwrap();
-    let mut stmt =
-        conn.prepare("SELECT local_id, text, done FROM todos WHERE device_id = ?1 ORDER BY local_id")?;
+    let mut stmt = conn
+        .prepare("SELECT local_id, text, done FROM todos WHERE device_id = ?1 ORDER BY local_id")?;
     let rows = stmt
         .query_map(params![device_id], |row| {
             Ok(Todo {
@@ -187,7 +220,12 @@ fn next_local_id(conn: &Connection, table: &str, device_id: i64) -> Result<u8> {
 /// Creates a new alarm (`id: None`) or replaces an existing one (`id:
 /// Some`) for `device_id`, and returns the alarm's id. Bumps the device's
 /// sync version either way.
-pub fn upsert_alarm(db: &Db, device_id: i64, id: Option<u8>, req: &UpsertAlarmRequest) -> Result<u8> {
+pub fn upsert_alarm(
+    db: &Db,
+    device_id: i64,
+    id: Option<u8>,
+    req: &UpsertAlarmRequest,
+) -> Result<u8> {
     let conn = db.lock().unwrap();
     let id = match id {
         Some(id) => id,
@@ -223,6 +261,15 @@ pub fn delete_alarm(db: &Db, device_id: i64, id: u8) -> Result<()> {
     Ok(())
 }
 
+pub fn clear_alarms(db: &Db, device_id: i64) -> Result<()> {
+    let conn = db.lock().unwrap();
+    conn.execute(
+        "DELETE FROM alarms WHERE device_id = ?1",
+        params![device_id],
+    )?;
+    bump_version(&conn, device_id)
+}
+
 pub fn upsert_todo(db: &Db, device_id: i64, id: Option<u8>, req: &UpsertTodoRequest) -> Result<u8> {
     let conn = db.lock().unwrap();
     let id = match id {
@@ -248,9 +295,101 @@ pub fn delete_todo(db: &Db, device_id: i64, id: u8) -> Result<()> {
     Ok(())
 }
 
+pub fn clear_todos(db: &Db, device_id: i64) -> Result<()> {
+    let conn = db.lock().unwrap();
+    conn.execute("DELETE FROM todos WHERE device_id = ?1", params![device_id])?;
+    bump_version(&conn, device_id)
+}
+
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bulk_clear_preserves_device_and_other_content() {
+        let db = open(":memory:").unwrap();
+        let device = register_device(&db, "test").unwrap();
+        upsert_alarm(
+            &db,
+            device.id,
+            None,
+            &UpsertAlarmRequest {
+                hour: 7,
+                minute: 30,
+                repeat: Repeat::Daily,
+                enabled: true,
+                label: "wake".to_string(),
+            },
+        )
+        .unwrap();
+        upsert_todo(
+            &db,
+            device.id,
+            None,
+            &UpsertTodoRequest {
+                text: "keep".to_string(),
+                done: false,
+            },
+        )
+        .unwrap();
+
+        clear_alarms(&db, device.id).unwrap();
+        assert!(list_alarms(&db, device.id).unwrap().is_empty());
+        assert_eq!(list_todos(&db, device.id).unwrap().len(), 1);
+        assert_eq!(list_devices(&db).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn device_merge_updates_flags_without_recreating_unknown_content() {
+        let db = open(":memory:").unwrap();
+        let device = register_device(&db, "test").unwrap();
+        let todo_id = upsert_todo(
+            &db,
+            device.id,
+            None,
+            &UpsertTodoRequest {
+                text: "server text".to_string(),
+                done: false,
+            },
+        )
+        .unwrap();
+        let before = find_device_by_token(&db, device.token.as_deref().unwrap())
+            .unwrap()
+            .unwrap()
+            .1;
+        merge_device_state(
+            &db,
+            device.id,
+            &DeviceSyncRequest {
+                alarms: vec![],
+                todos: vec![
+                    crate::models::DeviceTodoState {
+                        id: todo_id,
+                        done: true,
+                    },
+                    crate::models::DeviceTodoState {
+                        id: 250,
+                        done: true,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        let todos = list_todos(&db, device.id).unwrap();
+        assert_eq!(todos.len(), 1);
+        assert_eq!(todos[0].text, "server text");
+        assert!(todos[0].done);
+        let after = find_device_by_token(&db, device.token.as_deref().unwrap())
+            .unwrap()
+            .unwrap()
+            .1;
+        assert_eq!(after, before + 1);
+    }
 }

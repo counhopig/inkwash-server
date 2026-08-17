@@ -40,6 +40,30 @@ pub struct SyncResponse {
     pub todos: Vec<Todo>,
 }
 
+/// Mutable device-side state uploaded before the server returns its
+/// authoritative content. Text, schedules and membership remain managed by
+/// Desktop/Server; the device may only report completion/enabled flags for
+/// records that still exist on the server.
+#[derive(Clone, Debug, Deserialize)]
+pub struct DeviceSyncRequest {
+    #[serde(default)]
+    pub alarms: Vec<DeviceAlarmState>,
+    #[serde(default)]
+    pub todos: Vec<DeviceTodoState>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct DeviceAlarmState {
+    pub id: u8,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct DeviceTodoState {
+    pub id: u8,
+    pub done: bool,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Device {
     pub id: i64,

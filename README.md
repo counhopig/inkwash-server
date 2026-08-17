@@ -13,7 +13,8 @@ endpoint.
 ## Run
 
 ```bash
-ADMIN_TOKEN=$(openssl rand -hex 32) cargo run --release
+printf 'ADMIN_TOKEN=%s\n' "$(openssl rand -hex 32)" > .env
+cargo run --release
 ```
 
 Env vars:
@@ -24,8 +25,15 @@ Env vars:
 - `DATABASE_PATH` (default `inkpaper.sqlite3`) - SQLite file location.
 - `BIND_ADDR` (default `0.0.0.0:8080`) - listen address.
 
+The server automatically loads `.env` from its working directory. Values
+already present in the process environment take precedence.
+
 ## API
 
+Open `/` in a browser for the built-in test console. It can register devices,
+copy the one-time device token, and manage alarms and todos using `ADMIN_TOKEN`.
+
+- `GET /health` - unauthenticated liveness check.
 - `GET /api/sync` - device-facing, `Authorization: Bearer <device_token>`,
   supports `If-None-Match`. See `docs/sync-api.md` in the firmware repo
   for the exact contract this implements.
@@ -34,6 +42,11 @@ Env vars:
   device's token exactly once (not retrievable again afterward).
 - `GET/POST /api/devices/:id/alarms`, `PUT/DELETE /api/devices/:id/alarms/:alarm_id`
   and the equivalent `/todos` routes - admin, same auth.
+- `DELETE /api/devices/:id/alarms` and `/todos` clear the corresponding
+  collection while preserving the device and its other content.
+
+Invalid times, dates, empty names/todos, and overlong user-facing text are
+rejected with HTTP 400 before reaching SQLite.
 
 Alarm/todo JSON shapes mirror the firmware's `alarms::StoredAlarm`/
 `todos::Todo` types exactly (see `src/models.rs`) - the device deserializes
