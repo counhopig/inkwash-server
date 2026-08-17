@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 axum = { version = "0.7", features = ["json"] }
+dotenvy = "0.15"
 rand = "0.8"
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

@@ -10,6 +10,10 @@ use tower_http::trace::TraceLayer;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Load project-local configuration for direct binary/cargo launches.
+    // Variables already exported by the shell or service manager take precedence.
+    dotenvy::dotenv().ok();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
