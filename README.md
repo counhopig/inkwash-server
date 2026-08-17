@@ -35,8 +35,13 @@ copy the one-time device token, and manage alarms and todos using `ADMIN_TOKEN`.
 
 - `GET /health` - unauthenticated liveness check.
 - `GET /api/sync` - device-facing, `Authorization: Bearer <device_token>`,
-  supports `If-None-Match`. See `docs/sync-api.md` in the firmware repo
-  for the exact contract this implements.
+  supports `If-None-Match` (legacy/read-only pull; kept for older firmware).
+- `POST /api/sync` - device-facing, `Authorization: Bearer <device_token>`,
+  body `{"alarms":[{"id":u8,"enabled":bool}],"todos":[{"id":u8,"done":bool}]}`.
+  Merges the device's uploaded `enabled`/`done` flags into the stored alarms/
+  todos (unknown IDs are ignored) and returns the same JSON shape as `GET`.
+  This is what current firmware actually calls - see `docs/sync-api.md` in
+  the firmware repo for the exact contract both endpoints implement.
 - `POST /api/devices`, `GET /api/devices`, `DELETE /api/devices/:id` -
   admin, `Authorization: Bearer <ADMIN_TOKEN>`. Registration returns the
   device's token exactly once (not retrievable again afterward).
