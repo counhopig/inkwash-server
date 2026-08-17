@@ -12,10 +12,12 @@ endpoint.
 
 ## Run
 
+Easiest path - [`scripts/start.sh`](scripts/start.sh) handles first-run
+setup (generates `.env` with a random `ADMIN_TOKEN` if missing, runs
+`npm install` in `admin-ui/`) and then launches the server:
+
 ```bash
-printf 'ADMIN_TOKEN=%s\n' "$(openssl rand -hex 32)" > .env
-npm install --prefix admin-ui   # one-time: installs the admin console's build tooling
-cargo run --release
+./scripts/start.sh
 ```
 
 `cargo build`/`cargo run` runs `npm run build` in [`admin-ui/`](admin-ui) automatically
@@ -23,6 +25,14 @@ cargo run --release
 server stays a single deployable artifact - `npm install` is the only
 one-time setup step. See [`admin-ui/README.md`](admin-ui/README.md) for
 that app's own dev workflow.
+
+For a manual setup instead:
+
+```bash
+printf 'ADMIN_TOKEN=%s\n' "$(openssl rand -hex 32)" > .env
+npm install --prefix admin-ui   # one-time: installs the admin console's build tooling
+cargo run --release
+```
 
 Env vars:
 
