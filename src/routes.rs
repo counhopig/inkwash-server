@@ -90,27 +90,27 @@ fn bad_request(message: impl Into<String>) -> Response {
     (StatusCode::BAD_REQUEST, message.into()).into_response()
 }
 
-fn validate_alarm(req: &UpsertAlarmRequest) -> Result<(), Response> {
+fn validate_alarm(req: &UpsertAlarmRequest) -> Result<(), &'static str> {
     if req.hour > 23 || req.minute > 59 {
-        return Err(bad_request("hour must be 0..23 and minute must be 0..59"));
+        return Err("hour must be 0..23 and minute must be 0..59");
     }
     if req.label.chars().count() > 40 {
-        return Err(bad_request("alarm label must be at most 40 characters"));
+        return Err("alarm label must be at most 40 characters");
     }
     if let crate::models::Repeat::Once { year, month, day } = req.repeat {
         if !(1..=12).contains(&month) || !(1..=31).contains(&day) || year < 1970 {
-            return Err(bad_request("invalid once-alarm date"));
+            return Err("invalid once-alarm date");
         }
     }
     Ok(())
 }
 
-fn validate_todo(req: &UpsertTodoRequest) -> Result<(), Response> {
+fn validate_todo(req: &UpsertTodoRequest) -> Result<(), &'static str> {
     if req.text.trim().is_empty() {
-        return Err(bad_request("todo text must not be empty"));
+        return Err("todo text must not be empty");
     }
     if req.text.chars().count() > 120 {
-        return Err(bad_request("todo text must be at most 120 characters"));
+        return Err("todo text must be at most 120 characters");
     }
     Ok(())
 }
@@ -122,10 +122,10 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .and_then(|v| v.strip_prefix("Bearer "))
 }
 
-fn require_admin(headers: &HeaderMap, state: &AppState) -> Result<(), Response> {
+fn require_admin(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCode, &'static str)> {
     match bearer_token(headers) {
         Some(token) if token == state.admin_token => Ok(()),
-        _ => Err((StatusCode::UNAUTHORIZED, "missing or invalid admin token").into_response()),
+        _ => Err((StatusCode::UNAUTHORIZED, "missing or invalid admin token")),
     }
 }
 
@@ -230,7 +230,7 @@ async fn register_device(
     Json(req): Json<RegisterDeviceRequest>,
 ) -> Response {
     if let Err(resp) = require_admin(&headers, &state) {
-        return resp;
+        return resp.into_response();
     }
     if req.name.trim().is_empty() || req.name.chars().count() > 80 {
         return bad_request("device name must be 1..80 characters");
@@ -243,7 +243,7 @@ async fn register_device(
 
 async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(resp) = require_admin(&headers, &state) {
-        return resp;
+        return resp.into_response();
     }
     match db::list_devices(&state.db) {
         Ok(devices) => Json(devices).into_response(),
@@ -257,7 +257,7 @@ async fn delete_device(
     Path(device_id): Path<i64>,
 ) -> Response {
     if let Err(resp) = require_admin(&headers, &state) {
-        return resp;
+        return resp.into_response();
     }
     match db::delete_device(&state.db, device_id) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -273,7 +273,7 @@ async fn list_alarms(
     Path(device_id): Path<i64>,
 ) -> Response {
     if let Err(resp) = require_admin(&headers, &state) {
-        return resp;
+        return resp.into_response();
     }
     match db::list_alarms(&state.db, device_id) {
         Ok(alarms) => Json(alarms).into_response(),
@@ -288,10 +288,10 @@ async fn create_alarm(
     Json(req): Json<UpsertAlarmRequest>,
 ) -> Response {
     if let Err(resp) = require_admin(&headers, &state) {
-        return resp;
+        return resp.into_response();
     }
-    if let Err(resp) = validate_alarm(&req) {
-        return resp;
+    if let Err(msg) = validate_alarm(&req) {
+        return bad_request(msg);
     }
     match db::upsert_alarm(&state.db, device_id, None, &req) {
         Ok(id) => (StatusCode::CREATED, Json(serde_json::json!({ "id": id }))).into_response(),
@@ -306,10 +306,10 @@ async fn update_alarm(
     Json(req): Json<UpsertAlarmRequest>,
 ) -> Response {
     if let Err(resp) = require_admin(&headers, &state) {
-        return resp;
+        return resp.into_response();
     }
-    if let Err(resp) = validate_alarm(&req) {
-        return resp;
+    if let Err(msg) = validate_alarm(&req) {
+        return bad_request(msg);
     }
     match db::upsert_alarm(&state.db, device_id, Some(alarm_id), &req) {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
@@ -323,7 +323,7 @@ async fn clear_alarms(
     Path(device_id): Path<i64>,
 ) -> Response {
     if let Err(resp) = require_admin(&headers, &state) {
-        return resp;
+        return resp.into_response();
     }
     match db::clear_alarms(&state.db, device_id) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -337,7 +337,7 @@ async fn delete_alarm(
     Path((device_id, alarm_id)): Path<(i64, u8)>,
 ) -> Response {
     if let Err(resp) = require_admin(&headers, &state) {
-        return resp;
+        return resp.into_response();
     }
     match db::delete_alarm(&state.db, device_id, alarm_id) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -353,7 +353,7 @@ async fn list_todos(
     Path(device_id): Path<i64>,
 ) -> Response {
     if let Err(resp) = require_admin(&headers, &state) {
-        return resp;
+        return resp.into_response();
     }
     match db::list_todos(&state.db, device_id) {
         Ok(todos) => Json(todos).into_response(),
@@ -368,10 +368,10 @@ async fn create_todo(
     Json(req): Json<UpsertTodoRequest>,
 ) -> Response {
     if let Err(resp) = require_admin(&headers, &state) {
-        return resp;
+        return resp.into_response();
     }
-    if let Err(resp) = validate_todo(&req) {
-        return resp;
+    if let Err(msg) = validate_todo(&req) {
+        return bad_request(msg);
     }
     match db::upsert_todo(&state.db, device_id, None, &req) {
         Ok(id) => (StatusCode::CREATED, Json(serde_json::json!({ "id": id }))).into_response(),
@@ -386,10 +386,10 @@ async fn update_todo(
     Json(req): Json<UpsertTodoRequest>,
 ) -> Response {
     if let Err(resp) = require_admin(&headers, &state) {
-        return resp;
+        return resp.into_response();
     }
-    if let Err(resp) = validate_todo(&req) {
-        return resp;
+    if let Err(msg) = validate_todo(&req) {
+        return bad_request(msg);
     }
     match db::upsert_todo(&state.db, device_id, Some(todo_id), &req) {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
@@ -403,7 +403,7 @@ async fn clear_todos(
     Path(device_id): Path<i64>,
 ) -> Response {
     if let Err(resp) = require_admin(&headers, &state) {
-        return resp;
+        return resp.into_response();
     }
     match db::clear_todos(&state.db, device_id) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -417,7 +417,7 @@ async fn delete_todo(
     Path((device_id, todo_id)): Path<(i64, u8)>,
 ) -> Response {
     if let Err(resp) = require_admin(&headers, &state) {
-        return resp;
+        return resp.into_response();
     }
     match db::delete_todo(&state.db, device_id, todo_id) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
