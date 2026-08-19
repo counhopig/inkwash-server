@@ -1,86 +1,86 @@
 # Inkpaper Server
 
-Backend for the [Inkpaper NOTE4 firmware](../inkpaper) - stores alarms and
-todos per device and serves them over the sync contract documented in
-[`../inkpaper/docs/sync-api.md`](../inkpaper/docs/sync-api.md).
+Personal-scale cloud backend for the **Zectrix Note 4** e-ink device —
+stores alarms and todos per device and serves them over the sync contract.
+One half of the [**Inkpaper**](https://github.com/counhopig/inkpaper-firmware)
+ecosystem, alongside a PC tool and the device firmware.
 
-Rust + `axum` + `rusqlite` (SQLite, bundled - no system dependency).
-Personal-scale by design: one shared admin bearer token guards device
-registration and content management (not a multi-tenant service), and
-each registered device gets its own bearer token for the read-only sync
-endpoint.
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-edition%202021-orange.svg)](Cargo.toml)
+[![Platform](https://img.shields.io/badge/Platform-Linux%2FmacOS%2FWindows-lightgrey.svg)]()
+
+## What it is
+
+A small, **personal** cloud server for one user's devices — deliberately
+not multi-tenant. A single shared admin bearer token guards device
+registration and content management; each registered device gets its own
+bearer token for the sync endpoint. The admin console (a Vue 3 app) is
+compiled into the binary, so the server is a single deployable artifact.
+
+```mermaid
+flowchart LR
+    D[Zectrix Note 4<br/>inkpaper-firmware] -->|POST /api/sync<br/>done/enabled flags| S[inkpaper-server]
+    S -->|alarms[] todos[] JSON| D
+    T[inkpaper-desktop] -->|admin API / ADMIN_TOKEN| S
+    U[Browser] -->|embedded admin UI| S
+```
 
 ## Run
 
-Easiest path - [`scripts/start.sh`](scripts/start.sh) handles first-run
-setup (generates `.env` with a random `ADMIN_TOKEN` if missing, runs
-`npm install` in `admin-ui/`) and then launches the server:
+Easiest path — [`scripts/start.sh`](scripts/start.sh) generates a `.env`
+with a random `ADMIN_TOKEN`, runs `npm install` in `admin-ui/`, then
+launches:
 
 ```bash
 ./scripts/start.sh
 ```
 
-`cargo build`/`cargo run` runs `npm run build` in [`admin-ui/`](admin-ui) automatically
-(via `build.rs`) and embeds the compiled output into the binary, so the
-server stays a single deployable artifact - `npm install` is the only
-one-time setup step. See [`admin-ui/README.md`](admin-ui/README.md) for
-that app's own dev workflow.
-
-For a manual setup instead:
+Manual setup:
 
 ```bash
 printf 'ADMIN_TOKEN=%s\n' "$(openssl rand -hex 32)" > .env
-npm install --prefix admin-ui   # one-time: installs the admin console's build tooling
+npm install --prefix admin-ui
 cargo run --release
 ```
 
 Env vars:
 
-- `ADMIN_TOKEN` (required) - bearer token [`inkpaper-desktop`](../inkpaper-desktop)
-  uses for device registration and alarm/todo management. Generate a long
-  random string and keep it secret.
-- `DATABASE_PATH` (default `inkpaper.sqlite3`) - SQLite file location.
-- `BIND_ADDR` (default `0.0.0.0:8080`) - listen address.
+| Var            | Default               | Purpose                                   |
+| -------------- | --------------------- | ----------------------------------------- |
+| `ADMIN_TOKEN`  | _(required)_          | Bearer token for the admin API / console  |
+| `DATABASE_PATH`| `inkpaper.sqlite3`    | SQLite file location                      |
+| `BIND_ADDR`    | `0.0.0.0:8080`        | Listen address                            |
 
-The server automatically loads `.env` from its working directory. Values
-already present in the process environment take precedence.
+`.env` is loaded from the working directory; existing process
+environment takes precedence.
 
 ## API
 
-Open `/` in a browser for the admin console (`admin-ui/`, a small Vue 3
-app embedded into the binary). It can register devices, copy the
-one-time device token, and manage alarms and todos using `ADMIN_TOKEN`.
+- `GET /health` — unauthenticated liveness check.
+- `GET /api/sync` — device-facing (`Bearer <device_token>`), ETag/304
+  conditional pull (legacy; kept for older firmware).
+- `POST /api/sync` — device-facing (`Bearer <device_token>`): uploads
+  `enabled`/`done`/importance flags, merges them (unknown IDs ignored),
+  returns the authoritative `{alarms, todos}` list. This is what current
+  firmware calls — contract in the firmware repo's
+  [`docs/sync-api.md`](https://github.com/counhopig/inkpaper-firmware/blob/main/docs/sync-api.md).
+- `POST/GET/DELETE /api/devices[/:id]` — admin, `Bearer <ADMIN_TOKEN>`.
+  Registration returns the device token exactly once.
+- `/api/devices/:id/alarms` and `/todos` (GET/POST/PUT/DELETE, plus a
+  DELETE-to-clear on each collection) — admin, same auth.
 
-- `GET /health` - unauthenticated liveness check.
-- `GET /api/sync` - device-facing, `Authorization: Bearer <device_token>`,
-  supports `If-None-Match` (legacy/read-only pull; kept for older firmware).
-- `POST /api/sync` - device-facing, `Authorization: Bearer <device_token>`,
-  body `{"alarms":[{"id":u8,"enabled":bool}],"todos":[{"id":u8,"done":bool}]}`.
-  Merges the device's uploaded `enabled`/`done` flags into the stored alarms/
-  todos (unknown IDs are ignored) and returns the same JSON shape as `GET`.
-  This is what current firmware actually calls - see `docs/sync-api.md` in
-  the firmware repo for the exact contract both endpoints implement.
-- `POST /api/devices`, `GET /api/devices`, `DELETE /api/devices/:id` -
-  admin, `Authorization: Bearer <ADMIN_TOKEN>`. Registration returns the
-  device's token exactly once (not retrievable again afterward).
-- `GET/POST /api/devices/:id/alarms`, `PUT/DELETE /api/devices/:id/alarms/:alarm_id`
-  and the equivalent `/todos` routes - admin, same auth.
-- `DELETE /api/devices/:id/alarms` and `/todos` clear the corresponding
-  collection while preserving the device and its other content.
+Invalid times, dates, empty names/todos and overlong text are rejected
+with HTTP 400 before reaching SQLite.
 
-Invalid times, dates, empty names/todos, and overlong user-facing text are
-rejected with HTTP 400 before reaching SQLite.
+## Tests
 
-Alarm/todo JSON shapes mirror the firmware's `alarms::StoredAlarm`/
-`todos::Todo` types exactly (see `src/models.rs`) - the device deserializes
-the sync response directly into those types, no adapter layer.
+```bash
+cargo test          # 2 unit tests (DB schema + device-state merge)
+cd admin-ui && npm run build   # vue-tsc type check + vite build
+```
 
-## Status
+Exercised end-to-end against the physical device via `inkpaper-desktop`.
 
-Fully tested via a `curl`-driven pass: device registration, alarm/todo
-CRUD (both `Daily` and `Once` repeat kinds), the sync endpoint's JSON
-shape (verified byte-for-byte against the spec doc's example), ETag
-caching (200 then 304), and auth rejection on both surfaces. Also
-exercised for real against the physical device via `inkpaper-desktop`.
-See [`../inkpaper/docs/project-status.md`](../inkpaper/docs/project-status.md)
-for the full cross-repo status.
+## License
+
+[Apache-2.0](LICENSE).
