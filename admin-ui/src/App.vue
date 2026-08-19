@@ -21,6 +21,8 @@ const alarmMinute = ref(0);
 const alarmLabel = ref("");
 
 const todoText = ref("");
+const todoImportance = ref<"low" | "medium" | "high">("medium");
+const todoDue = ref("");
 
 const toastText = ref("");
 const toastVisible = ref(false);
@@ -158,6 +160,15 @@ async function clearAlarms() {
   }
 }
 
+function parseDueDate(raw: string): { month: number; day: number } | null {
+  const m = raw.trim().match(/^(\d{1,2})-(\d{1,2})$/);
+  if (!m) return null;
+  const month = Number(m[1]);
+  const day = Number(m[2]);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  return { month, day };
+}
+
 async function addTodo() {
   const id = selectedDeviceId.value;
   const text = todoText.value.trim();
@@ -165,14 +176,50 @@ async function addTodo() {
     toast("Select a device and enter text");
     return;
   }
-  const r = await api.createTodo(token.value, id, { text, done: false });
+  const due = todoDue.value.trim();
+  const dueDate = due ? parseDueDate(due) : null;
+  if (due && !dueDate) {
+    toast("Due date must be MM-DD");
+    return;
+  }
+  const r = await api.createTodo(token.value, id, {
+    text,
+    done: false,
+    importance: todoImportance.value,
+    due_date: dueDate,
+  });
   if (!r.ok) {
     toast(r.error);
     return;
   }
   todoText.value = "";
+  todoDue.value = "";
   await loadContent();
   toast("Todo added");
+}
+
+function todoBadge(importance: "low" | "medium" | "high"): string {
+  return importance === "high" ? "H" : importance === "medium" ? "M" : "L";
+}
+
+function formatDue(t: Todo): string {
+  if (!t.due_date) return "";
+  return `${pad(t.due_date.month)}-${pad(t.due_date.day)}`;
+}
+
+async function cycleImportance(t: Todo) {
+  const id = selectedDeviceId.value;
+  if (id == null) return;
+  const next: "low" | "medium" | "high" =
+    t.importance === "low" ? "medium" : t.importance === "medium" ? "high" : "low";
+  const r = await api.updateTodo(token.value, id, t.id, {
+    text: t.text,
+    done: t.done,
+    importance: next,
+    due_date: t.due_date,
+  });
+  if (!r.ok) toast(r.error);
+  else await loadContent();
 }
 
 async function deleteTodo(todoId: number) {
@@ -297,6 +344,12 @@ onMounted(() => {
             </div>
             <div class="row">
               <input v-model="todoText" class="grow" placeholder="Test todo" @keyup.enter="addTodo" />
+              <select v-model="todoImportance" title="Importance">
+                <option value="low">L</option>
+                <option value="medium">M</option>
+                <option value="high">H</option>
+              </select>
+              <input v-model="todoDue" placeholder="MM-DD" style="width: 70px" @keyup.enter="addTodo" />
               <button class="primary" :disabled="selectedDeviceId == null" @click="addTodo">Add</button>
             </div>
             <div class="list">
@@ -305,7 +358,9 @@ onMounted(() => {
                 <span class="text">
                   {{ t.done ? "✓ " : "" }}{{ t.text }}
                   <template v-if="t.done"><br /><span class="meta">Completed</span></template>
+                  <template v-else-if="t.due_date"><br /><span class="meta">Due {{ formatDue(t) }}</span></template>
                 </span>
+                <button :title="'Importance: ' + t.importance" @click="cycleImportance(t)">{{ todoBadge(t.importance) }}</button>
                 <button class="danger" @click="deleteTodo(t.id)">Delete</button>
               </div>
             </div>

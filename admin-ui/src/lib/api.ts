@@ -72,6 +72,13 @@ export function createTodo(token: string, deviceId: number, input: UpsertTodoInp
   });
 }
 
+export function updateTodo(token: string, deviceId: number, todoId: number, input: UpsertTodoInput) {
+  return request<void>(`/api/devices/${deviceId}/todos/${todoId}`, token, {
+    method: "PUT",
+    body: JSON.stringify(input),
+  });
+}
+
 export function deleteTodo(token: string, deviceId: number, todoId: number) {
   return request<void>(`/api/devices/${deviceId}/todos/${todoId}`, token, { method: "DELETE" });
 }

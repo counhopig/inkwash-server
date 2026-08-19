@@ -25,11 +25,47 @@ pub struct Alarm {
     pub label: String,
 }
 
+/// Todo importance, serialized snake_case (`"low"`/`"medium"`/`"high"`) to
+/// match the firmware's `todos::Importance`. `Medium` is the default so
+/// records created before importance existed stay comparable.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Importance {
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+impl Importance {
+    /// Stable string used as the SQLite column value (`low`/`medium`/`high`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Importance::Low => "low",
+            Importance::Medium => "medium",
+            Importance::High => "high",
+        }
+    }
+}
+
+/// Optional due date of a todo - month/day without a year (a recurring
+/// "every year on this date" semantics is deliberately out of scope; the
+/// device calendar shows the marker on that day of the current month).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TodoDue {
+    pub month: u8,
+    pub day: u8,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Todo {
     pub id: u8,
     pub text: String,
     pub done: bool,
+    #[serde(default)]
+    pub importance: Importance,
+    #[serde(default)]
+    pub due_date: Option<TodoDue>,
 }
 
 /// Body of a successful (HTTP 200) `GET /api/sync` response - see
@@ -62,6 +98,10 @@ pub struct DeviceAlarmState {
 pub struct DeviceTodoState {
     pub id: u8,
     pub done: bool,
+    /// `None` when an older firmware uploads without importance - only
+    /// present states are applied.
+    #[serde(default)]
+    pub importance: Option<Importance>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -94,4 +134,8 @@ pub struct UpsertTodoRequest {
     pub text: String,
     #[serde(default)]
     pub done: bool,
+    #[serde(default)]
+    pub importance: Importance,
+    #[serde(default)]
+    pub due_date: Option<TodoDue>,
 }

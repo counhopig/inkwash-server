@@ -13,7 +13,8 @@ use rand::Rng;
 use rusqlite::{params, Connection};
 
 use crate::models::{
-    Alarm, Device, DeviceSyncRequest, Repeat, Todo, UpsertAlarmRequest, UpsertTodoRequest,
+    Alarm, Device, DeviceSyncRequest, Importance, Repeat, Todo, UpsertAlarmRequest,
+    UpsertTodoRequest,
 };
 
 pub type Db = Arc<Mutex<Connection>>;
@@ -52,6 +53,16 @@ pub fn open(path: &str) -> Result<Db> {
         );
         ",
     )?;
+    // Migrate databases created before importance/due_date existed:
+    // `CREATE TABLE IF NOT EXISTS` never adds columns, so add them
+    // explicitly and ignore the duplicate-column error on fresh DBs.
+    for stmt in [
+        "ALTER TABLE todos ADD COLUMN importance TEXT NOT NULL DEFAULT 'medium'",
+        "ALTER TABLE todos ADD COLUMN due_month INTEGER",
+        "ALTER TABLE todos ADD COLUMN due_day INTEGER",
+    ] {
+        let _ = conn.execute(stmt, []);
+    }
     Ok(Arc::new(Mutex::new(conn)))
 }
 
@@ -147,6 +158,12 @@ pub fn merge_device_state(db: &Db, device_id: i64, state: &DeviceSyncRequest) ->
             "UPDATE todos SET done = ?3 WHERE device_id = ?1 AND local_id = ?2 AND done != ?3",
             params![device_id, todo.id, todo.done],
         )? > 0;
+        if let Some(importance) = todo.importance {
+            changed |= tx.execute(
+                "UPDATE todos SET importance = ?3 WHERE device_id = ?1 AND local_id = ?2 AND importance != ?3",
+                params![device_id, todo.id, importance.as_str()],
+            )? > 0;
+        }
     }
     if changed {
         bump_version(&tx, device_id)?;
@@ -193,14 +210,27 @@ pub fn list_alarms(db: &Db, device_id: i64) -> Result<Vec<Alarm>> {
 
 pub fn list_todos(db: &Db, device_id: i64) -> Result<Vec<Todo>> {
     let conn = db.lock().unwrap();
-    let mut stmt = conn
-        .prepare("SELECT local_id, text, done FROM todos WHERE device_id = ?1 ORDER BY local_id")?;
+    let mut stmt = conn.prepare(
+        "SELECT local_id, text, done, importance, due_month, due_day
+         FROM todos WHERE device_id = ?1 ORDER BY local_id",
+    )?;
     let rows = stmt
         .query_map(params![device_id], |row| {
+            let importance_str: String = row.get(3)?;
+            let due_month: Option<i64> = row.get(4)?;
+            let due_day: Option<i64> = row.get(5)?;
             Ok(Todo {
                 id: row.get(0)?,
                 text: row.get(1)?,
                 done: row.get::<_, i64>(2)? != 0,
+                importance: importance_from_str(&importance_str),
+                due_date: match (due_month, due_day) {
+                    (Some(month), Some(day)) => Some(crate::models::TodoDue {
+                        month: month as u8,
+                        day: day as u8,
+                    }),
+                    _ => None,
+                },
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -276,10 +306,25 @@ pub fn upsert_todo(db: &Db, device_id: i64, id: Option<u8>, req: &UpsertTodoRequ
         Some(id) => id,
         None => next_local_id(&conn, "todos", device_id)?,
     };
+    let (due_month, due_day) = match req.due_date {
+        Some(due) => (Some(due.month as i64), Some(due.day as i64)),
+        None => (None, None),
+    };
     conn.execute(
-        "INSERT INTO todos (device_id, local_id, text, done) VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT(device_id, local_id) DO UPDATE SET text=excluded.text, done=excluded.done",
-        params![device_id, id, req.text, req.done],
+        "INSERT INTO todos (device_id, local_id, text, done, importance, due_month, due_day)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(device_id, local_id) DO UPDATE SET
+            text=excluded.text, done=excluded.done, importance=excluded.importance,
+            due_month=excluded.due_month, due_day=excluded.due_day",
+        params![
+            device_id,
+            id,
+            req.text,
+            req.done,
+            req.importance.as_str(),
+            due_month,
+            due_day
+        ],
     )?;
     bump_version(&conn, device_id)?;
     Ok(id)
@@ -306,6 +351,16 @@ fn now_unix() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+/// Parses the SQLite `importance` column; unknown/legacy values fall back
+/// to `Medium`.
+fn importance_from_str(s: &str) -> Importance {
+    match s {
+        "low" => Importance::Low,
+        "high" => Importance::High,
+        _ => Importance::Medium,
+    }
 }
 
 #[cfg(test)]
@@ -336,13 +391,21 @@ mod tests {
             &UpsertTodoRequest {
                 text: "keep".to_string(),
                 done: false,
+                importance: Importance::High,
+                due_date: Some(crate::models::TodoDue { month: 12, day: 25 }),
             },
         )
         .unwrap();
 
         clear_alarms(&db, device.id).unwrap();
         assert!(list_alarms(&db, device.id).unwrap().is_empty());
-        assert_eq!(list_todos(&db, device.id).unwrap().len(), 1);
+        let todos = list_todos(&db, device.id).unwrap();
+        assert_eq!(todos.len(), 1);
+        assert_eq!(todos[0].importance, Importance::High);
+        assert_eq!(
+            todos[0].due_date,
+            Some(crate::models::TodoDue { month: 12, day: 25 })
+        );
         assert_eq!(list_devices(&db).unwrap().len(), 1);
     }
 
@@ -357,6 +420,8 @@ mod tests {
             &UpsertTodoRequest {
                 text: "server text".to_string(),
                 done: false,
+                importance: Importance::Low,
+                due_date: None,
             },
         )
         .unwrap();
@@ -373,10 +438,12 @@ mod tests {
                     crate::models::DeviceTodoState {
                         id: todo_id,
                         done: true,
+                        importance: Some(Importance::High),
                     },
                     crate::models::DeviceTodoState {
                         id: 250,
                         done: true,
+                        importance: None,
                     },
                 ],
             },
@@ -386,6 +453,7 @@ mod tests {
         assert_eq!(todos.len(), 1);
         assert_eq!(todos[0].text, "server text");
         assert!(todos[0].done);
+        assert_eq!(todos[0].importance, Importance::High);
         let after = find_device_by_token(&db, device.token.as_deref().unwrap())
             .unwrap()
             .unwrap()

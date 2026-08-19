@@ -9,10 +9,19 @@ export interface Alarm {
   label: string;
 }
 
+export type Importance = "low" | "medium" | "high";
+
+export interface TodoDue {
+  month: number;
+  day: number;
+}
+
 export interface Todo {
   id: number;
   text: string;
   done: boolean;
+  importance: Importance;
+  due_date: TodoDue | null;
 }
 
 export interface Device {
@@ -33,4 +42,6 @@ export interface UpsertAlarmInput {
 export interface UpsertTodoInput {
   text: string;
   done: boolean;
+  importance: Importance;
+  due_date: TodoDue | null;
 }
