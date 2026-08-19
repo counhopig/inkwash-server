@@ -3,7 +3,7 @@ import { computed, onMounted, ref } from "vue";
 import * as api from "./lib/api";
 import { copyText } from "./lib/clipboard";
 import { loadAdminToken, saveAdminToken } from "./lib/storage";
-import type { Alarm, Device, Todo } from "./lib/types";
+import type { Alarm, Device, Repeat, Todo, TodoDue } from "./lib/types";
 
 const token = ref(loadAdminToken());
 const connected = ref(false);
@@ -19,10 +19,15 @@ const newDeviceToken = ref<string | null>(null);
 const alarmHour = ref(7);
 const alarmMinute = ref(0);
 const alarmLabel = ref("");
+const alarmRepeatKind = ref<"Daily" | "Weekly" | "Monthly" | "Once">("Daily");
+const alarmRepeatDays = ref("");
+const alarmOnceDate = ref("");
 
 const todoText = ref("");
 const todoImportance = ref<"low" | "medium" | "high">("medium");
 const todoDue = ref("");
+const todoRepeatKind = ref<"" | "Daily" | "Weekly" | "Monthly">("");
+const todoRepeatDays = ref("");
 
 const toastText = ref("");
 const toastVisible = ref(false);
@@ -128,7 +133,7 @@ async function addAlarm() {
   const r = await api.createAlarm(token.value, id, {
     hour: alarmHour.value,
     minute: alarmMinute.value,
-    repeat: "Daily",
+    repeat: buildRepeat(alarmRepeatKind.value, alarmRepeatDays.value, alarmOnceDate.value),
     enabled: true,
     label: alarmLabel.value.trim(),
   });
@@ -139,6 +144,23 @@ async function addAlarm() {
   alarmLabel.value = "";
   await loadContent();
   toast("Alarm added");
+}
+
+function buildRepeat(kind: string, daysRaw: string, onceDate: string): Repeat {
+  if (kind === "Weekly" || kind === "Monthly") {
+    const days = daysRaw
+      .split(",")
+      .map((s) => Number(s.trim()))
+      .filter((n) => Number.isFinite(n));
+    return kind === "Weekly" ? { Weekly: { days } } : { Monthly: { days } };
+  }
+  if (kind === "Once") {
+    const m = onceDate.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+    if (m) {
+      return { Once: { year: Number(m[1]), month: Number(m[2]), day: Number(m[3]) } };
+    }
+  }
+  return "Daily";
 }
 
 async function deleteAlarm(alarmId: number) {
@@ -160,13 +182,14 @@ async function clearAlarms() {
   }
 }
 
-function parseDueDate(raw: string): { month: number; day: number } | null {
-  const m = raw.trim().match(/^(\d{1,2})-(\d{1,2})$/);
+function parseDueDate(raw: string): TodoDue | null {
+  const m = raw.trim().match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
   if (!m) return null;
-  const month = Number(m[1]);
-  const day = Number(m[2]);
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
   if (month < 1 || month > 12 || day < 1 || day > 31) return null;
-  return { month, day };
+  return { year, month, day };
 }
 
 async function addTodo() {
@@ -179,14 +202,18 @@ async function addTodo() {
   const due = todoDue.value.trim();
   const dueDate = due ? parseDueDate(due) : null;
   if (due && !dueDate) {
-    toast("Due date must be MM-DD");
+    toast("Due date must be YYYY-MM-DD");
     return;
   }
+  const repeat = todoRepeatKind.value
+    ? buildRepeat(todoRepeatKind.value, todoRepeatDays.value, "")
+    : null;
   const r = await api.createTodo(token.value, id, {
     text,
     done: false,
     importance: todoImportance.value,
     due_date: dueDate,
+    repeat,
   });
   if (!r.ok) {
     toast(r.error);
@@ -194,6 +221,8 @@ async function addTodo() {
   }
   todoText.value = "";
   todoDue.value = "";
+  todoRepeatKind.value = "";
+  todoRepeatDays.value = "";
   await loadContent();
   toast("Todo added");
 }
@@ -204,7 +233,16 @@ function todoBadge(importance: "low" | "medium" | "high"): string {
 
 function formatDue(t: Todo): string {
   if (!t.due_date) return "";
-  return `${pad(t.due_date.month)}-${pad(t.due_date.day)}`;
+  const d = t.due_date;
+  return `${pad(d.year)}-${pad(d.month)}-${pad(d.day)}`;
+}
+
+function repeatLabel(r: Repeat | null): string {
+  if (!r) return "Once";
+  if (r === "Daily") return "Daily";
+  if ("Weekly" in r) return `Weekly [${r.Weekly.days.join(",")}]`;
+  if ("Monthly" in r) return `Monthly [${r.Monthly.days.join(",")}]`;
+  return `Once ${pad(r.Once.year)}-${pad(r.Once.month)}-${pad(r.Once.day)}`;
 }
 
 async function cycleImportance(t: Todo) {
@@ -217,6 +255,7 @@ async function cycleImportance(t: Todo) {
     done: t.done,
     importance: next,
     due_date: t.due_date,
+    repeat: t.repeat,
   });
   if (!r.ok) toast(r.error);
   else await loadContent();
@@ -324,12 +363,26 @@ onMounted(() => {
               <label class="grow">Label<input v-model="alarmLabel" placeholder="Wake up" /></label>
               <button class="primary" :disabled="selectedDeviceId == null" @click="addAlarm">Add</button>
             </div>
+            <div class="row" style="margin-top: 8px">
+              <label>Repeat
+                <select v-model="alarmRepeatKind">
+                  <option value="Daily">Daily</option>
+                  <option value="Weekly">Weekly</option>
+                  <option value="Monthly">Monthly</option>
+                  <option value="Once">Once</option>
+                </select>
+              </label>
+              <label v-if="alarmRepeatKind === 'Weekly' || alarmRepeatKind === 'Monthly'">Days (comma-sep)
+                <input v-model="alarmRepeatDays" :placeholder="alarmRepeatKind === 'Weekly' ? '0,2,4 (0=Sun)' : '1,15'" style="width: 130px" />
+              </label>
+              <label v-if="alarmRepeatKind === 'Once'">Date<input v-model="alarmOnceDate" type="date" /></label>
+            </div>
             <div class="list">
               <div v-if="alarms.length === 0" class="empty">{{ selectedDeviceId == null ? "No device selected" : "No alarms scheduled" }}</div>
               <div v-for="a in alarms" :key="a.id" class="item">
                 <span class="text">
                   <b>{{ pad(a.hour) }}:{{ pad(a.minute) }}</b><br />
-                  <span class="meta">{{ a.label || "No label" }} · {{ a.enabled ? "Enabled" : "Disabled" }}</span>
+                  <span class="meta">{{ a.label || "No label" }} · {{ repeatLabel(a.repeat) }} · {{ a.enabled ? "Enabled" : "Disabled" }}</span>
                 </span>
                 <button class="danger" @click="deleteAlarm(a.id)">Delete</button>
               </div>
@@ -349,7 +402,14 @@ onMounted(() => {
                 <option value="medium">M</option>
                 <option value="high">H</option>
               </select>
-              <input v-model="todoDue" placeholder="MM-DD" style="width: 70px" @keyup.enter="addTodo" />
+              <input v-model="todoDue" type="date" title="Due date" @keyup.enter="addTodo" />
+              <select v-model="todoRepeatKind" title="Repeat">
+                <option value="">Once</option>
+                <option value="Daily">Daily</option>
+                <option value="Weekly">Weekly</option>
+                <option value="Monthly">Monthly</option>
+              </select>
+              <input v-if="todoRepeatKind === 'Weekly' || todoRepeatKind === 'Monthly'" v-model="todoRepeatDays" :placeholder="todoRepeatKind === 'Weekly' ? '0,2,4' : '1,15'" style="width: 70px" />
               <button class="primary" :disabled="selectedDeviceId == null" @click="addTodo">Add</button>
             </div>
             <div class="list">
@@ -358,7 +418,7 @@ onMounted(() => {
                 <span class="text">
                   {{ t.done ? "✓ " : "" }}{{ t.text }}
                   <template v-if="t.done"><br /><span class="meta">Completed</span></template>
-                  <template v-else-if="t.due_date"><br /><span class="meta">Due {{ formatDue(t) }}</span></template>
+                  <template v-else-if="t.due_date || t.repeat"><br /><span class="meta">Due {{ t.due_date ? formatDue(t) : "—" }} · {{ repeatLabel(t.repeat) }}</span></template>
                 </span>
                 <button :title="'Importance: ' + t.importance" @click="cycleImportance(t)">{{ todoBadge(t.importance) }}</button>
                 <button class="danger" @click="deleteTodo(t.id)">Delete</button>

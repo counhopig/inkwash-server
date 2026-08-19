@@ -7,12 +7,27 @@
 use serde::{Deserialize, Serialize};
 
 /// Externally-tagged to match the firmware's plain `serde` derive on
-/// `enum Repeat { Daily, Once { year, month, day } }`: `Daily` serializes
-/// as the bare string `"Daily"`, `Once` as `{"Once": {"year":...}}`.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// `enum Repeat { Daily, Weekly{..}, Monthly{..}, Once{..} }`: `Daily`
+/// serializes as the bare string `"Daily"`, the rest as `{"Weekly": {...}}`
+/// etc. Weekdays are 0=Sunday..6=Saturday; month days are 1..=31.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Repeat {
     Daily,
+    Weekly { days: Vec<u8> },
+    Monthly { days: Vec<u8> },
     Once { year: u16, month: u8, day: u8 },
+}
+
+impl Repeat {
+    /// Stable discriminator used as the SQLite `repeat_kind` column.
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Repeat::Daily => "daily",
+            Repeat::Weekly { .. } => "weekly",
+            Repeat::Monthly { .. } => "monthly",
+            Repeat::Once { .. } => "once",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -48,11 +63,13 @@ impl Importance {
     }
 }
 
-/// Optional due date of a todo - month/day without a year (a recurring
-/// "every year on this date" semantics is deliberately out of scope; the
-/// device calendar shows the marker on that day of the current month).
+/// Full due date of a todo. The `year` field defaults to 0 for records
+/// synced before it existed; such todos have no concrete date and simply
+/// don't mark the device calendar or remind until re-edited.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TodoDue {
+    #[serde(default)]
+    pub year: u16,
     pub month: u8,
     pub day: u8,
 }
@@ -64,8 +81,13 @@ pub struct Todo {
     pub done: bool,
     #[serde(default)]
     pub importance: Importance,
+    /// Single due date (used when `repeat` is `None`).
     #[serde(default)]
     pub due_date: Option<TodoDue>,
+    /// Recurrence schedule; when set, the todo is due on every date the
+    /// schedule covers instead of just `due_date`.
+    #[serde(default)]
+    pub repeat: Option<Repeat>,
 }
 
 /// Body of a successful (HTTP 200) `GET /api/sync` response - see
@@ -140,4 +162,6 @@ pub struct UpsertTodoRequest {
     pub importance: Importance,
     #[serde(default)]
     pub due_date: Option<TodoDue>,
+    #[serde(default)]
+    pub repeat: Option<Repeat>,
 }

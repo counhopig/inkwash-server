@@ -1,4 +1,9 @@
-export type Repeat = "Daily" | { Once: { year: number; month: number; day: number } };
+/** Weekdays are 0=Sunday..6=Saturday; month days are 1..=31. */
+export type Repeat =
+  | "Daily"
+  | { Weekly: { days: number[] } }
+  | { Monthly: { days: number[] } }
+  | { Once: { year: number; month: number; day: number } };
 
 export interface Alarm {
   id: number;
@@ -12,6 +17,7 @@ export interface Alarm {
 export type Importance = "low" | "medium" | "high";
 
 export interface TodoDue {
+  year: number;
   month: number;
   day: number;
 }
@@ -22,6 +28,7 @@ export interface Todo {
   done: boolean;
   importance: Importance;
   due_date: TodoDue | null;
+  repeat: Repeat | null;
 }
 
 export interface Device {
@@ -45,4 +52,5 @@ export interface UpsertTodoInput {
   done: boolean;
   importance: Importance;
   due_date: TodoDue | null;
+  repeat: Repeat | null;
 }

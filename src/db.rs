@@ -38,6 +38,7 @@ const ALARMS_TABLE: &str = "
         once_year INTEGER,
         once_month INTEGER,
         once_day INTEGER,
+        repeat_days TEXT,
         enabled INTEGER NOT NULL,
         label TEXT NOT NULL,
         PRIMARY KEY (device_id, local_id)
@@ -49,8 +50,11 @@ const TODOS_TABLE: &str = "
         text TEXT NOT NULL,
         done INTEGER NOT NULL,
         importance TEXT NOT NULL DEFAULT 'medium',
+        due_year INTEGER,
         due_month INTEGER,
         due_day INTEGER,
+        repeat_kind TEXT,
+        repeat_days TEXT,
         PRIMARY KEY (device_id, local_id)
     )";
 
@@ -59,13 +63,17 @@ pub fn open(path: &str) -> Result<Db> {
     conn.pragma_update(None, "foreign_keys", true)?;
     conn.execute_batch(&format!("{DEVICES_TABLE}; {ALARMS_TABLE}; {TODOS_TABLE};"))?;
     migrate_legacy_integer_ids(&mut conn)?;
-    // Databases created before importance/due_date existed are missing
-    // these columns; `CREATE TABLE IF NOT EXISTS` never adds columns, so
-    // add them explicitly and ignore the duplicate-column error.
+    // Databases created before these columns existed are missing them;
+    // `CREATE TABLE IF NOT EXISTS` never adds columns, so add them
+    // explicitly and ignore the duplicate-column error.
     for stmt in [
         "ALTER TABLE todos ADD COLUMN importance TEXT NOT NULL DEFAULT 'medium'",
         "ALTER TABLE todos ADD COLUMN due_month INTEGER",
         "ALTER TABLE todos ADD COLUMN due_day INTEGER",
+        "ALTER TABLE todos ADD COLUMN due_year INTEGER",
+        "ALTER TABLE todos ADD COLUMN repeat_kind TEXT",
+        "ALTER TABLE todos ADD COLUMN repeat_days TEXT",
+        "ALTER TABLE alarms ADD COLUMN repeat_days TEXT",
     ] {
         let _ = conn.execute(stmt, []);
     }
@@ -315,28 +323,26 @@ pub fn merge_device_state(db: &Db, device_id: &str, state: &DeviceSyncRequest) -
 pub fn list_alarms(db: &Db, device_id: &str) -> Result<Vec<Alarm>> {
     let conn = db.lock().unwrap();
     let mut stmt = conn.prepare(
-        "SELECT local_id, hour, minute, repeat_kind, once_year, once_month, once_day, enabled, label
+        "SELECT local_id, hour, minute, repeat_kind, once_year, once_month, once_day, repeat_days, enabled, label
          FROM alarms WHERE device_id = ?1 ORDER BY local_id",
     )?;
     let rows = stmt
         .query_map(params![device_id], |row| {
             let repeat_kind: String = row.get(3)?;
-            let repeat = if repeat_kind == "once" {
-                Repeat::Once {
-                    year: row.get(4)?,
-                    month: row.get(5)?,
-                    day: row.get(6)?,
-                }
-            } else {
-                Repeat::Daily
-            };
+            let repeat = repeat_from_columns(
+                &repeat_kind,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+            );
             Ok(Alarm {
                 id: row.get(0)?,
                 hour: row.get(1)?,
                 minute: row.get(2)?,
                 repeat,
-                enabled: row.get::<_, i64>(7)? != 0,
-                label: row.get(8)?,
+                enabled: row.get::<_, i64>(8)? != 0,
+                label: row.get(9)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -346,26 +352,38 @@ pub fn list_alarms(db: &Db, device_id: &str) -> Result<Vec<Alarm>> {
 pub fn list_todos(db: &Db, device_id: &str) -> Result<Vec<Todo>> {
     let conn = db.lock().unwrap();
     let mut stmt = conn.prepare(
-        "SELECT local_id, text, done, importance, due_month, due_day
+        "SELECT local_id, text, done, importance, due_year, due_month, due_day, repeat_kind, repeat_days
          FROM todos WHERE device_id = ?1 ORDER BY local_id",
     )?;
     let rows = stmt
         .query_map(params![device_id], |row| {
             let importance_str: String = row.get(3)?;
-            let due_month: Option<i64> = row.get(4)?;
-            let due_day: Option<i64> = row.get(5)?;
+            let due_year: Option<i64> = row.get(4)?;
+            let due_month: Option<i64> = row.get(5)?;
+            let due_day: Option<i64> = row.get(6)?;
+            let repeat_kind: Option<String> = row.get(7)?;
+            let repeat_days: Option<String> = row.get(8)?;
+            let due_date = match (due_year, due_month, due_day) {
+                (year, Some(month), Some(day)) => Some(crate::models::TodoDue {
+                    year: year.unwrap_or(0) as u16,
+                    month: month as u8,
+                    day: day as u8,
+                }),
+                _ => None,
+            };
+            let repeat = match repeat_kind.as_deref() {
+                Some(kind) if !kind.is_empty() => {
+                    Some(repeat_from_columns(kind, None, None, None, repeat_days))
+                }
+                _ => None,
+            };
             Ok(Todo {
                 id: row.get(0)?,
                 text: row.get(1)?,
                 done: row.get::<_, i64>(2)? != 0,
                 importance: importance_from_str(&importance_str),
-                due_date: match (due_month, due_day) {
-                    (Some(month), Some(day)) => Some(crate::models::TodoDue {
-                        month: month as u8,
-                        day: day as u8,
-                    }),
-                    _ => None,
-                },
+                due_date,
+                repeat,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -396,20 +414,19 @@ pub fn upsert_alarm(
         Some(id) => id,
         None => next_local_id(&conn, "alarms", device_id)?,
     };
-    let (repeat_kind, once_year, once_month, once_day) = match req.repeat {
-        Repeat::Daily => ("daily", None, None, None),
-        Repeat::Once { year, month, day } => ("once", Some(year), Some(month), Some(day)),
-    };
+    let (repeat_kind, once_year, once_month, once_day, repeat_days) =
+        repeat_to_columns(&req.repeat);
     conn.execute(
-        "INSERT INTO alarms (device_id, local_id, hour, minute, repeat_kind, once_year, once_month, once_day, enabled, label)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "INSERT INTO alarms (device_id, local_id, hour, minute, repeat_kind, once_year, once_month, once_day, repeat_days, enabled, label)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
          ON CONFLICT(device_id, local_id) DO UPDATE SET
             hour=excluded.hour, minute=excluded.minute, repeat_kind=excluded.repeat_kind,
             once_year=excluded.once_year, once_month=excluded.once_month, once_day=excluded.once_day,
+            repeat_days=excluded.repeat_days,
             enabled=excluded.enabled, label=excluded.label",
         params![
             device_id, id, req.hour, req.minute, repeat_kind, once_year, once_month, once_day,
-            req.enabled, req.label
+            repeat_days, req.enabled, req.label
         ],
     )?;
     bump_version(&conn, device_id)?;
@@ -446,24 +463,41 @@ pub fn upsert_todo(
         Some(id) => id,
         None => next_local_id(&conn, "todos", device_id)?,
     };
-    let (due_month, due_day) = match req.due_date {
-        Some(due) => (Some(due.month as i64), Some(due.day as i64)),
-        None => (None, None),
+    let (due_year, due_month, due_day) = match req.due_date {
+        Some(due) => (
+            Some(due.year as i64),
+            Some(due.month as i64),
+            Some(due.day as i64),
+        ),
+        None => (None, None, None),
+    };
+    // A todo's one-off nature is expressed by `due_date`; `Once` repeats
+    // are folded to no-repeat so a repeating schedule can't lose its
+    // meaning in the todos table (which has no once columns).
+    let (repeat_kind, repeat_days) = match req.repeat.as_ref() {
+        Some(Repeat::Daily) => (Some("daily"), None),
+        Some(Repeat::Weekly { days }) => (Some("weekly"), repeat_days_json_opt(days)),
+        Some(Repeat::Monthly { days }) => (Some("monthly"), repeat_days_json_opt(days)),
+        Some(Repeat::Once { .. }) | None => (None, None),
     };
     conn.execute(
-        "INSERT INTO todos (device_id, local_id, text, done, importance, due_month, due_day)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "INSERT INTO todos (device_id, local_id, text, done, importance, due_year, due_month, due_day, repeat_kind, repeat_days)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(device_id, local_id) DO UPDATE SET
             text=excluded.text, done=excluded.done, importance=excluded.importance,
-            due_month=excluded.due_month, due_day=excluded.due_day",
+            due_year=excluded.due_year, due_month=excluded.due_month, due_day=excluded.due_day,
+            repeat_kind=excluded.repeat_kind, repeat_days=excluded.repeat_days",
         params![
             device_id,
             id,
             req.text,
             req.done,
             req.importance.as_str(),
+            due_year,
             due_month,
-            due_day
+            due_day,
+            repeat_kind,
+            repeat_days
         ],
     )?;
     bump_version(&conn, device_id)?;
@@ -503,6 +537,75 @@ fn importance_from_str(s: &str) -> Importance {
     }
 }
 
+/// Serializes a `Weekly`/`Monthly` day list to the JSON `repeat_days`
+/// column (compact, spaces stripped).
+fn repeat_days_json_opt(days: &[u8]) -> Option<String> {
+    serde_json::to_string(days).ok().map(|s| s.replace(' ', ""))
+}
+
+/// Flattens a `Repeat` into the column tuple (`repeat_kind`,
+/// `once_year`, `once_month`, `once_day`, `repeat_days`). `repeat_days`
+/// holds the JSON array of covered days for `Weekly`/`Monthly` schedules.
+fn repeat_to_columns(
+    repeat: &Repeat,
+) -> (
+    &'static str,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+) {
+    match repeat {
+        Repeat::Daily => ("daily", None, None, None, None),
+        Repeat::Weekly { days } | Repeat::Monthly { days } => {
+            (repeat.kind(), None, None, None, repeat_days_json_opt(days))
+        }
+        Repeat::Once { year, month, day } => (
+            "once",
+            Some(*year as i64),
+            Some(*month as i64),
+            Some(*day as i64),
+            None,
+        ),
+    }
+}
+
+/// Rebuilds a `Repeat` from the flattened columns; unknown/legacy values
+/// fall back to `Daily`.
+fn repeat_from_columns(
+    repeat_kind: &str,
+    once_year: Option<i64>,
+    once_month: Option<i64>,
+    once_day: Option<i64>,
+    repeat_days: Option<String>,
+) -> Repeat {
+    match repeat_kind {
+        "once" => match (once_year, once_month, once_day) {
+            (Some(year), Some(month), Some(day)) => Repeat::Once {
+                year: year as u16,
+                month: month as u8,
+                day: day as u8,
+            },
+            _ => Repeat::Daily,
+        },
+        "weekly" => Repeat::Weekly {
+            days: repeat_days_json(repeat_days.as_deref()),
+        },
+        "monthly" => Repeat::Monthly {
+            days: repeat_days_json(repeat_days.as_deref()),
+        },
+        _ => Repeat::Daily,
+    }
+}
+
+/// Parses the `repeat_days` JSON column into a `Vec<u8>`; empty/malformed
+/// values become an empty vec (harmless - such a schedule simply never
+/// fires and the UI should not produce it).
+fn repeat_days_json(raw: Option<&str>) -> Vec<u8> {
+    raw.and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,7 +635,12 @@ mod tests {
                 text: "keep".to_string(),
                 done: false,
                 importance: Importance::High,
-                due_date: Some(crate::models::TodoDue { month: 12, day: 25 }),
+                due_date: Some(crate::models::TodoDue {
+                    year: 2026,
+                    month: 12,
+                    day: 25,
+                }),
+                repeat: None,
             },
         )
         .unwrap();
@@ -544,7 +652,11 @@ mod tests {
         assert_eq!(todos[0].importance, Importance::High);
         assert_eq!(
             todos[0].due_date,
-            Some(crate::models::TodoDue { month: 12, day: 25 })
+            Some(crate::models::TodoDue {
+                year: 2026,
+                month: 12,
+                day: 25
+            })
         );
         assert_eq!(list_devices(&db).unwrap().len(), 1);
     }
@@ -562,6 +674,7 @@ mod tests {
                 done: false,
                 importance: Importance::Low,
                 due_date: None,
+                repeat: None,
             },
         )
         .unwrap();
