@@ -20,7 +20,7 @@ compiled into the binary, so the server is a single deployable artifact.
 ```mermaid
 flowchart LR
     D[Zectrix Note 4<br/>inkpaper-firmware] -->|POST /api/sync<br/>done/enabled flags| S[inkpaper-server]
-    S -->|alarms[] todos[] JSON| D
+    S -->"alarms + todos JSON" D
     T[inkpaper-desktop] -->|admin API / ADMIN_TOKEN| S
     U[Browser] -->|embedded admin UI| S
 ```
