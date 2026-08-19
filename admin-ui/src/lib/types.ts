@@ -25,7 +25,8 @@ export interface Todo {
 }
 
 export interface Device {
-  id: number;
+  /** UUID (v4) string, opaque - not a sequential number. */
+  id: string;
   name: string;
   /** Only present once, in the response to registerDevice(). */
   token?: string;

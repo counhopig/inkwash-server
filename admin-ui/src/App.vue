@@ -9,7 +9,7 @@ const token = ref(loadAdminToken());
 const connected = ref(false);
 
 const devices = ref<Device[]>([]);
-const selectedDeviceId = ref<number | null>(null);
+const selectedDeviceId = ref<string | null>(null);
 const alarms = ref<Alarm[]>([]);
 const todos = ref<Todo[]>([]);
 
@@ -87,7 +87,7 @@ async function copyNewDeviceToken() {
   toast(ok ? "Copied" : "Copy failed - select the token and copy manually");
 }
 
-async function deleteDevice(id: number) {
+async function deleteDevice(id: string) {
   if (!confirm("Delete this device and all its content?")) return;
   const r = await api.deleteDevice(token.value, id);
   if (!r.ok) {
@@ -99,7 +99,7 @@ async function deleteDevice(id: number) {
   await loadDevices();
 }
 
-function pickDevice(id: number) {
+function pickDevice(id: string) {
   newDeviceToken.value = null;
   selectedDeviceId.value = id;
   loadContent();
@@ -277,9 +277,9 @@ onMounted(() => {
             <span class="count">{{ devices.length }}</span>
           </div>
           <div class="stack">
-            <select :value="selectedDeviceId ?? ''" @change="(e) => pickDevice(Number((e.target as HTMLSelectElement).value))">
+            <select :value="selectedDeviceId ?? ''" @change="(e) => pickDevice((e.target as HTMLSelectElement).value)">
               <option value="" disabled>{{ devices.length ? "Select a device" : "Connect first" }}</option>
-              <option v-for="d in devices" :key="d.id" :value="d.id">#{{ d.id }} · {{ d.name }}</option>
+              <option v-for="d in devices" :key="d.id" :value="d.id">{{ d.name }}</option>
             </select>
             <div class="row">
               <button class="quiet" @click="loadDevices">Refresh</button>

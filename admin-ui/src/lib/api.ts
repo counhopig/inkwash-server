@@ -38,51 +38,51 @@ export function registerDevice(token: string, name: string) {
   });
 }
 
-export function deleteDevice(token: string, id: number) {
+export function deleteDevice(token: string, id: string) {
   return request<void>(`/api/devices/${id}`, token, { method: "DELETE" });
 }
 
-export function listAlarms(token: string, deviceId: number) {
+export function listAlarms(token: string, deviceId: string) {
   return request<Alarm[]>(`/api/devices/${deviceId}/alarms`, token);
 }
 
-export function createAlarm(token: string, deviceId: number, input: UpsertAlarmInput) {
+export function createAlarm(token: string, deviceId: string, input: UpsertAlarmInput) {
   return request<{ id: number }>(`/api/devices/${deviceId}/alarms`, token, {
     method: "POST",
     body: JSON.stringify(input),
   });
 }
 
-export function deleteAlarm(token: string, deviceId: number, alarmId: number) {
+export function deleteAlarm(token: string, deviceId: string, alarmId: number) {
   return request<void>(`/api/devices/${deviceId}/alarms/${alarmId}`, token, { method: "DELETE" });
 }
 
-export function clearAlarms(token: string, deviceId: number) {
+export function clearAlarms(token: string, deviceId: string) {
   return request<void>(`/api/devices/${deviceId}/alarms`, token, { method: "DELETE" });
 }
 
-export function listTodos(token: string, deviceId: number) {
+export function listTodos(token: string, deviceId: string) {
   return request<Todo[]>(`/api/devices/${deviceId}/todos`, token);
 }
 
-export function createTodo(token: string, deviceId: number, input: UpsertTodoInput) {
+export function createTodo(token: string, deviceId: string, input: UpsertTodoInput) {
   return request<{ id: number }>(`/api/devices/${deviceId}/todos`, token, {
     method: "POST",
     body: JSON.stringify(input),
   });
 }
 
-export function updateTodo(token: string, deviceId: number, todoId: number, input: UpsertTodoInput) {
+export function updateTodo(token: string, deviceId: string, todoId: number, input: UpsertTodoInput) {
   return request<void>(`/api/devices/${deviceId}/todos/${todoId}`, token, {
     method: "PUT",
     body: JSON.stringify(input),
   });
 }
 
-export function deleteTodo(token: string, deviceId: number, todoId: number) {
+export function deleteTodo(token: string, deviceId: string, todoId: number) {
   return request<void>(`/api/devices/${deviceId}/todos/${todoId}`, token, { method: "DELETE" });
 }
 
-export function clearTodos(token: string, deviceId: number) {
+export function clearTodos(token: string, deviceId: string) {
   return request<void>(`/api/devices/${deviceId}/todos`, token, { method: "DELETE" });
 }

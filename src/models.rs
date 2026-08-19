@@ -106,7 +106,9 @@ pub struct DeviceTodoState {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Device {
-    pub id: i64,
+    /// UUID (v4) - opaque string, not an enumerable integer, so ids can't
+    /// be guessed or iterated by an attacker who steals one url.
+    pub id: String,
     pub name: String,
     /// Only ever returned once, at registration time - not readable again
     /// afterward (see `db::register_device`'s doc comment).

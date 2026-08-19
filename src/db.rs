@@ -11,6 +11,7 @@ use anyhow::{anyhow, Context, Result};
 use rand::distributions::Alphanumeric;
 use rand::Rng;
 use rusqlite::{params, Connection};
+use uuid::Uuid;
 
 use crate::models::{
     Alarm, Device, DeviceSyncRequest, Importance, Repeat, Todo, UpsertAlarmRequest,
@@ -19,43 +20,48 @@ use crate::models::{
 
 pub type Db = Arc<Mutex<Connection>>;
 
+const DEVICES_TABLE: &str = "
+    CREATE TABLE devices (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        token TEXT NOT NULL UNIQUE,
+        version INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL
+    )";
+const ALARMS_TABLE: &str = "
+    CREATE TABLE alarms (
+        device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+        local_id INTEGER NOT NULL,
+        hour INTEGER NOT NULL,
+        minute INTEGER NOT NULL,
+        repeat_kind TEXT NOT NULL,
+        once_year INTEGER,
+        once_month INTEGER,
+        once_day INTEGER,
+        enabled INTEGER NOT NULL,
+        label TEXT NOT NULL,
+        PRIMARY KEY (device_id, local_id)
+    )";
+const TODOS_TABLE: &str = "
+    CREATE TABLE todos (
+        device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+        local_id INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        done INTEGER NOT NULL,
+        importance TEXT NOT NULL DEFAULT 'medium',
+        due_month INTEGER,
+        due_day INTEGER,
+        PRIMARY KEY (device_id, local_id)
+    )";
+
 pub fn open(path: &str) -> Result<Db> {
-    let conn = Connection::open(path).with_context(|| format!("failed to open {path}"))?;
+    let mut conn = Connection::open(path).with_context(|| format!("failed to open {path}"))?;
     conn.pragma_update(None, "foreign_keys", true)?;
-    conn.execute_batch(
-        "
-        CREATE TABLE IF NOT EXISTS devices (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            token TEXT NOT NULL UNIQUE,
-            version INTEGER NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS alarms (
-            device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
-            local_id INTEGER NOT NULL,
-            hour INTEGER NOT NULL,
-            minute INTEGER NOT NULL,
-            repeat_kind TEXT NOT NULL,
-            once_year INTEGER,
-            once_month INTEGER,
-            once_day INTEGER,
-            enabled INTEGER NOT NULL,
-            label TEXT NOT NULL,
-            PRIMARY KEY (device_id, local_id)
-        );
-        CREATE TABLE IF NOT EXISTS todos (
-            device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
-            local_id INTEGER NOT NULL,
-            text TEXT NOT NULL,
-            done INTEGER NOT NULL,
-            PRIMARY KEY (device_id, local_id)
-        );
-        ",
-    )?;
-    // Migrate databases created before importance/due_date existed:
-    // `CREATE TABLE IF NOT EXISTS` never adds columns, so add them
-    // explicitly and ignore the duplicate-column error on fresh DBs.
+    conn.execute_batch(&format!("{DEVICES_TABLE}; {ALARMS_TABLE}; {TODOS_TABLE};"))?;
+    migrate_legacy_integer_ids(&mut conn)?;
+    // Databases created before importance/due_date existed are missing
+    // these columns; `CREATE TABLE IF NOT EXISTS` never adds columns, so
+    // add them explicitly and ignore the duplicate-column error.
     for stmt in [
         "ALTER TABLE todos ADD COLUMN importance TEXT NOT NULL DEFAULT 'medium'",
         "ALTER TABLE todos ADD COLUMN due_month INTEGER",
@@ -64,6 +70,135 @@ pub fn open(path: &str) -> Result<Db> {
         let _ = conn.execute(stmt, []);
     }
     Ok(Arc::new(Mutex::new(conn)))
+}
+
+/// Legacy pre-UUID `alarms` row shape used only by the migration snapshot.
+type LegacyAlarmRow = (
+    i64,
+    i64,
+    i64,
+    i64,
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    i64,
+    String,
+);
+
+/// Migrates databases from the pre-UUID era where `devices.id` was an
+/// `INTEGER PRIMARY KEY AUTOINCREMENT` and `alarms`/`todos` referenced it
+/// with an INTEGER `device_id`. Personal-scale data (a handful of devices,
+/// each with a handful of records) is copied over row by row; the device
+/// auth token is preserved, so devices keep syncing without re-registering.
+fn migrate_legacy_integer_ids(conn: &mut Connection) -> Result<()> {
+    let legacy: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('devices') WHERE name = 'id' AND type = 'INTEGER'",
+        [],
+        |row| row.get(0),
+    )?;
+    if legacy == 0 {
+        return Ok(());
+    }
+    tracing::info!("detected pre-UUID device ids; migrating to UUID keys");
+
+    // Snapshot the legacy rows, then rename the old tables out of the way.
+    let devices: Vec<(i64, String, String, i64, i64)> = conn
+        .prepare("SELECT id, name, token, version, created_at FROM devices")?
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let alarms: Vec<LegacyAlarmRow> =
+        conn.prepare(
+            "SELECT device_id, local_id, hour, minute, repeat_kind, once_year, once_month, once_day, enabled, label FROM alarms",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let todos: Vec<(i64, i64, String, i64)> = conn
+        .prepare("SELECT device_id, local_id, text, done FROM todos")?
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    conn.execute_batch(&format!(
+        "DROP TABLE alarms; DROP TABLE todos; DROP TABLE devices;
+         {DEVICES_TABLE}; {ALARMS_TABLE}; {TODOS_TABLE};"
+    ))?;
+
+    let mut id_map = std::collections::HashMap::new();
+    for (old_id, name, token, version, created_at) in &devices {
+        let new_id = Uuid::new_v4().to_string();
+        id_map.insert(*old_id, new_id.clone());
+        conn.execute(
+            "INSERT INTO devices (id, name, token, version, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![new_id, name, token, version, created_at],
+        )?;
+    }
+    for (
+        device_id,
+        local_id,
+        hour,
+        minute,
+        repeat_kind,
+        once_year,
+        once_month,
+        once_day,
+        enabled,
+        label,
+    ) in &alarms
+    {
+        let Some(new_device_id) = id_map.get(device_id) else {
+            continue;
+        };
+        conn.execute(
+            "INSERT INTO alarms (device_id, local_id, hour, minute, repeat_kind, once_year, once_month, once_day, enabled, label)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                new_device_id,
+                local_id,
+                hour,
+                minute,
+                repeat_kind,
+                once_year,
+                once_month,
+                once_day,
+                enabled,
+                label
+            ],
+        )?;
+    }
+    for (device_id, local_id, text, done) in &todos {
+        let Some(new_device_id) = id_map.get(device_id) else {
+            continue;
+        };
+        conn.execute(
+            "INSERT INTO todos (device_id, local_id, text, done) VALUES (?1, ?2, ?3, ?4)",
+            params![new_device_id, local_id, text, done],
+        )?;
+    }
+    tracing::info!("migrated {} devices to UUID ids", devices.len());
+    Ok(())
 }
 
 fn new_token() -> String {
@@ -82,11 +217,11 @@ pub fn register_device(db: &Db, name: &str) -> Result<Device> {
     let conn = db.lock().unwrap();
     let token = new_token();
     let now = now_unix();
+    let id = Uuid::new_v4().to_string();
     conn.execute(
-        "INSERT INTO devices (name, token, version, created_at) VALUES (?1, ?2, 0, ?3)",
-        params![name, token, now],
+        "INSERT INTO devices (id, name, token, version, created_at) VALUES (?1, ?2, ?3, 0, ?4)",
+        params![id, name, token, now],
     )?;
-    let id = conn.last_insert_rowid();
     Ok(Device {
         id,
         name: name.to_string(),
@@ -96,7 +231,7 @@ pub fn register_device(db: &Db, name: &str) -> Result<Device> {
 
 pub fn list_devices(db: &Db) -> Result<Vec<Device>> {
     let conn = db.lock().unwrap();
-    let mut stmt = conn.prepare("SELECT id, name FROM devices ORDER BY id")?;
+    let mut stmt = conn.prepare("SELECT id, name FROM devices ORDER BY name")?;
     let rows = stmt
         .query_map([], |row| {
             Ok(Device {
@@ -109,7 +244,7 @@ pub fn list_devices(db: &Db) -> Result<Vec<Device>> {
     Ok(rows)
 }
 
-pub fn delete_device(db: &Db, device_id: i64) -> Result<()> {
+pub fn delete_device(db: &Db, device_id: &str) -> Result<()> {
     let conn = db.lock().unwrap();
     conn.execute("DELETE FROM devices WHERE id = ?1", params![device_id])?;
     Ok(())
@@ -118,7 +253,7 @@ pub fn delete_device(db: &Db, device_id: i64) -> Result<()> {
 /// Looks up the device owning `token`, returning `(device_id, version)`.
 /// `version` becomes the ETag for `GET /api/sync` - see
 /// `routes::device_sync`.
-pub fn find_device_by_token(db: &Db, token: &str) -> Result<Option<(i64, i64)>> {
+pub fn find_device_by_token(db: &Db, token: &str) -> Result<Option<(String, i64)>> {
     let conn = db.lock().unwrap();
     conn.query_row(
         "SELECT id, version FROM devices WHERE token = ?1",
@@ -132,7 +267,7 @@ pub fn find_device_by_token(db: &Db, token: &str) -> Result<Option<(i64, i64)>> 
     })
 }
 
-fn bump_version(conn: &Connection, device_id: i64) -> Result<()> {
+fn bump_version(conn: &Connection, device_id: &str) -> Result<()> {
     conn.execute(
         "UPDATE devices SET version = version + 1 WHERE id = ?1",
         params![device_id],
@@ -143,7 +278,7 @@ fn bump_version(conn: &Connection, device_id: i64) -> Result<()> {
 /// Applies only the fields the physical device is allowed to edit. Unknown
 /// IDs are ignored so stale device caches cannot recreate content deleted by
 /// Desktop/Server. Returns the resulting device version.
-pub fn merge_device_state(db: &Db, device_id: i64, state: &DeviceSyncRequest) -> Result<i64> {
+pub fn merge_device_state(db: &Db, device_id: &str, state: &DeviceSyncRequest) -> Result<i64> {
     let mut conn = db.lock().unwrap();
     let tx = conn.transaction()?;
     let mut changed = false;
@@ -177,7 +312,7 @@ pub fn merge_device_state(db: &Db, device_id: i64, state: &DeviceSyncRequest) ->
     Ok(version)
 }
 
-pub fn list_alarms(db: &Db, device_id: i64) -> Result<Vec<Alarm>> {
+pub fn list_alarms(db: &Db, device_id: &str) -> Result<Vec<Alarm>> {
     let conn = db.lock().unwrap();
     let mut stmt = conn.prepare(
         "SELECT local_id, hour, minute, repeat_kind, once_year, once_month, once_day, enabled, label
@@ -208,7 +343,7 @@ pub fn list_alarms(db: &Db, device_id: i64) -> Result<Vec<Alarm>> {
     Ok(rows)
 }
 
-pub fn list_todos(db: &Db, device_id: i64) -> Result<Vec<Todo>> {
+pub fn list_todos(db: &Db, device_id: &str) -> Result<Vec<Todo>> {
     let conn = db.lock().unwrap();
     let mut stmt = conn.prepare(
         "SELECT local_id, text, done, importance, due_month, due_day
@@ -237,7 +372,7 @@ pub fn list_todos(db: &Db, device_id: i64) -> Result<Vec<Todo>> {
     Ok(rows)
 }
 
-fn next_local_id(conn: &Connection, table: &str, device_id: i64) -> Result<u8> {
+fn next_local_id(conn: &Connection, table: &str, device_id: &str) -> Result<u8> {
     let max: Option<i64> = conn.query_row(
         &format!("SELECT MAX(local_id) FROM {table} WHERE device_id = ?1"),
         params![device_id],
@@ -252,7 +387,7 @@ fn next_local_id(conn: &Connection, table: &str, device_id: i64) -> Result<u8> {
 /// sync version either way.
 pub fn upsert_alarm(
     db: &Db,
-    device_id: i64,
+    device_id: &str,
     id: Option<u8>,
     req: &UpsertAlarmRequest,
 ) -> Result<u8> {
@@ -281,7 +416,7 @@ pub fn upsert_alarm(
     Ok(id)
 }
 
-pub fn delete_alarm(db: &Db, device_id: i64, id: u8) -> Result<()> {
+pub fn delete_alarm(db: &Db, device_id: &str, id: u8) -> Result<()> {
     let conn = db.lock().unwrap();
     conn.execute(
         "DELETE FROM alarms WHERE device_id = ?1 AND local_id = ?2",
@@ -291,7 +426,7 @@ pub fn delete_alarm(db: &Db, device_id: i64, id: u8) -> Result<()> {
     Ok(())
 }
 
-pub fn clear_alarms(db: &Db, device_id: i64) -> Result<()> {
+pub fn clear_alarms(db: &Db, device_id: &str) -> Result<()> {
     let conn = db.lock().unwrap();
     conn.execute(
         "DELETE FROM alarms WHERE device_id = ?1",
@@ -300,7 +435,12 @@ pub fn clear_alarms(db: &Db, device_id: i64) -> Result<()> {
     bump_version(&conn, device_id)
 }
 
-pub fn upsert_todo(db: &Db, device_id: i64, id: Option<u8>, req: &UpsertTodoRequest) -> Result<u8> {
+pub fn upsert_todo(
+    db: &Db,
+    device_id: &str,
+    id: Option<u8>,
+    req: &UpsertTodoRequest,
+) -> Result<u8> {
     let conn = db.lock().unwrap();
     let id = match id {
         Some(id) => id,
@@ -330,7 +470,7 @@ pub fn upsert_todo(db: &Db, device_id: i64, id: Option<u8>, req: &UpsertTodoRequ
     Ok(id)
 }
 
-pub fn delete_todo(db: &Db, device_id: i64, id: u8) -> Result<()> {
+pub fn delete_todo(db: &Db, device_id: &str, id: u8) -> Result<()> {
     let conn = db.lock().unwrap();
     conn.execute(
         "DELETE FROM todos WHERE device_id = ?1 AND local_id = ?2",
@@ -340,7 +480,7 @@ pub fn delete_todo(db: &Db, device_id: i64, id: u8) -> Result<()> {
     Ok(())
 }
 
-pub fn clear_todos(db: &Db, device_id: i64) -> Result<()> {
+pub fn clear_todos(db: &Db, device_id: &str) -> Result<()> {
     let conn = db.lock().unwrap();
     conn.execute("DELETE FROM todos WHERE device_id = ?1", params![device_id])?;
     bump_version(&conn, device_id)
@@ -373,7 +513,7 @@ mod tests {
         let device = register_device(&db, "test").unwrap();
         upsert_alarm(
             &db,
-            device.id,
+            device.id.as_str(),
             None,
             &UpsertAlarmRequest {
                 hour: 7,
@@ -386,7 +526,7 @@ mod tests {
         .unwrap();
         upsert_todo(
             &db,
-            device.id,
+            device.id.as_str(),
             None,
             &UpsertTodoRequest {
                 text: "keep".to_string(),
@@ -397,9 +537,9 @@ mod tests {
         )
         .unwrap();
 
-        clear_alarms(&db, device.id).unwrap();
-        assert!(list_alarms(&db, device.id).unwrap().is_empty());
-        let todos = list_todos(&db, device.id).unwrap();
+        clear_alarms(&db, device.id.as_str()).unwrap();
+        assert!(list_alarms(&db, device.id.as_str()).unwrap().is_empty());
+        let todos = list_todos(&db, device.id.as_str()).unwrap();
         assert_eq!(todos.len(), 1);
         assert_eq!(todos[0].importance, Importance::High);
         assert_eq!(
@@ -415,7 +555,7 @@ mod tests {
         let device = register_device(&db, "test").unwrap();
         let todo_id = upsert_todo(
             &db,
-            device.id,
+            device.id.as_str(),
             None,
             &UpsertTodoRequest {
                 text: "server text".to_string(),
@@ -431,7 +571,7 @@ mod tests {
             .1;
         merge_device_state(
             &db,
-            device.id,
+            device.id.as_str(),
             &DeviceSyncRequest {
                 alarms: vec![],
                 todos: vec![
@@ -449,7 +589,7 @@ mod tests {
             },
         )
         .unwrap();
-        let todos = list_todos(&db, device.id).unwrap();
+        let todos = list_todos(&db, device.id.as_str()).unwrap();
         assert_eq!(todos.len(), 1);
         assert_eq!(todos[0].text, "server text");
         assert!(todos[0].done);

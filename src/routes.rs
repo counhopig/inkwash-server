@@ -161,11 +161,11 @@ async fn device_sync(State(state): State<AppState>, headers: HeaderMap) -> Respo
         return StatusCode::NOT_MODIFIED.into_response();
     }
 
-    let alarms = match db::list_alarms(&state.db, device_id) {
+    let alarms = match db::list_alarms(&state.db, &device_id) {
         Ok(v) => v,
         Err(err) => return internal_error(err),
     };
-    let todos = match db::list_todos(&state.db, device_id) {
+    let todos = match db::list_todos(&state.db, &device_id) {
         Ok(v) => v,
         Err(err) => return internal_error(err),
     };
@@ -194,15 +194,15 @@ async fn device_push_sync(
         Ok(None) => return (StatusCode::UNAUTHORIZED, "unknown device token").into_response(),
         Err(err) => return internal_error(err),
     };
-    let version = match db::merge_device_state(&state.db, device_id, &req) {
+    let version = match db::merge_device_state(&state.db, &device_id, &req) {
         Ok(version) => version,
         Err(err) => return internal_error(err),
     };
-    let alarms = match db::list_alarms(&state.db, device_id) {
+    let alarms = match db::list_alarms(&state.db, &device_id) {
         Ok(value) => value,
         Err(err) => return internal_error(err),
     };
-    let todos = match db::list_todos(&state.db, device_id) {
+    let todos = match db::list_todos(&state.db, &device_id) {
         Ok(value) => value,
         Err(err) => return internal_error(err),
     };
@@ -254,12 +254,12 @@ async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> Resp
 async fn delete_device(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(device_id): Path<i64>,
+    Path(device_id): Path<String>,
 ) -> Response {
     if let Err(resp) = require_admin(&headers, &state) {
         return resp.into_response();
     }
-    match db::delete_device(&state.db, device_id) {
+    match db::delete_device(&state.db, &device_id) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => internal_error(err),
     }
@@ -270,12 +270,12 @@ async fn delete_device(
 async fn list_alarms(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(device_id): Path<i64>,
+    Path(device_id): Path<String>,
 ) -> Response {
     if let Err(resp) = require_admin(&headers, &state) {
         return resp.into_response();
     }
-    match db::list_alarms(&state.db, device_id) {
+    match db::list_alarms(&state.db, &device_id) {
         Ok(alarms) => Json(alarms).into_response(),
         Err(err) => internal_error(err),
     }
@@ -284,7 +284,7 @@ async fn list_alarms(
 async fn create_alarm(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(device_id): Path<i64>,
+    Path(device_id): Path<String>,
     Json(req): Json<UpsertAlarmRequest>,
 ) -> Response {
     if let Err(resp) = require_admin(&headers, &state) {
@@ -293,7 +293,7 @@ async fn create_alarm(
     if let Err(msg) = validate_alarm(&req) {
         return bad_request(msg);
     }
-    match db::upsert_alarm(&state.db, device_id, None, &req) {
+    match db::upsert_alarm(&state.db, &device_id, None, &req) {
         Ok(id) => (StatusCode::CREATED, Json(serde_json::json!({ "id": id }))).into_response(),
         Err(err) => internal_error(err),
     }
@@ -302,7 +302,7 @@ async fn create_alarm(
 async fn update_alarm(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((device_id, alarm_id)): Path<(i64, u8)>,
+    Path((device_id, alarm_id)): Path<(String, u8)>,
     Json(req): Json<UpsertAlarmRequest>,
 ) -> Response {
     if let Err(resp) = require_admin(&headers, &state) {
@@ -311,7 +311,7 @@ async fn update_alarm(
     if let Err(msg) = validate_alarm(&req) {
         return bad_request(msg);
     }
-    match db::upsert_alarm(&state.db, device_id, Some(alarm_id), &req) {
+    match db::upsert_alarm(&state.db, &device_id, Some(alarm_id), &req) {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => internal_error(err),
     }
@@ -320,12 +320,12 @@ async fn update_alarm(
 async fn clear_alarms(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(device_id): Path<i64>,
+    Path(device_id): Path<String>,
 ) -> Response {
     if let Err(resp) = require_admin(&headers, &state) {
         return resp.into_response();
     }
-    match db::clear_alarms(&state.db, device_id) {
+    match db::clear_alarms(&state.db, &device_id) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => internal_error(err),
     }
@@ -334,12 +334,12 @@ async fn clear_alarms(
 async fn delete_alarm(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((device_id, alarm_id)): Path<(i64, u8)>,
+    Path((device_id, alarm_id)): Path<(String, u8)>,
 ) -> Response {
     if let Err(resp) = require_admin(&headers, &state) {
         return resp.into_response();
     }
-    match db::delete_alarm(&state.db, device_id, alarm_id) {
+    match db::delete_alarm(&state.db, &device_id, alarm_id) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => internal_error(err),
     }
@@ -350,12 +350,12 @@ async fn delete_alarm(
 async fn list_todos(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(device_id): Path<i64>,
+    Path(device_id): Path<String>,
 ) -> Response {
     if let Err(resp) = require_admin(&headers, &state) {
         return resp.into_response();
     }
-    match db::list_todos(&state.db, device_id) {
+    match db::list_todos(&state.db, &device_id) {
         Ok(todos) => Json(todos).into_response(),
         Err(err) => internal_error(err),
     }
@@ -364,7 +364,7 @@ async fn list_todos(
 async fn create_todo(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(device_id): Path<i64>,
+    Path(device_id): Path<String>,
     Json(req): Json<UpsertTodoRequest>,
 ) -> Response {
     if let Err(resp) = require_admin(&headers, &state) {
@@ -373,7 +373,7 @@ async fn create_todo(
     if let Err(msg) = validate_todo(&req) {
         return bad_request(msg);
     }
-    match db::upsert_todo(&state.db, device_id, None, &req) {
+    match db::upsert_todo(&state.db, &device_id, None, &req) {
         Ok(id) => (StatusCode::CREATED, Json(serde_json::json!({ "id": id }))).into_response(),
         Err(err) => internal_error(err),
     }
@@ -382,7 +382,7 @@ async fn create_todo(
 async fn update_todo(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((device_id, todo_id)): Path<(i64, u8)>,
+    Path((device_id, todo_id)): Path<(String, u8)>,
     Json(req): Json<UpsertTodoRequest>,
 ) -> Response {
     if let Err(resp) = require_admin(&headers, &state) {
@@ -391,7 +391,7 @@ async fn update_todo(
     if let Err(msg) = validate_todo(&req) {
         return bad_request(msg);
     }
-    match db::upsert_todo(&state.db, device_id, Some(todo_id), &req) {
+    match db::upsert_todo(&state.db, &device_id, Some(todo_id), &req) {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => internal_error(err),
     }
@@ -400,12 +400,12 @@ async fn update_todo(
 async fn clear_todos(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(device_id): Path<i64>,
+    Path(device_id): Path<String>,
 ) -> Response {
     if let Err(resp) = require_admin(&headers, &state) {
         return resp.into_response();
     }
-    match db::clear_todos(&state.db, device_id) {
+    match db::clear_todos(&state.db, &device_id) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => internal_error(err),
     }
@@ -414,12 +414,12 @@ async fn clear_todos(
 async fn delete_todo(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((device_id, todo_id)): Path<(i64, u8)>,
+    Path((device_id, todo_id)): Path<(String, u8)>,
 ) -> Response {
     if let Err(resp) = require_admin(&headers, &state) {
         return resp.into_response();
     }
-    match db::delete_todo(&state.db, device_id, todo_id) {
+    match db::delete_todo(&state.db, &device_id, todo_id) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => internal_error(err),
     }
