@@ -1,11 +1,11 @@
 # AGENTS.md
 
-Personal-scale device-cloud backend in Rust + axum: an admin API guarded by the single `ADMIN_TOKEN` **plus** console-account sessions (`POST /api/auth/*`, Argon2id passwords, per-account device ownership), and a device-facing sync endpoint `/api/sync` (per-device tokens, ETag/304 caching). The Vue 3 console `admin-ui/` is embedded into the binary at compile time via rust-embed. One of three repos: firmware + protocol docs live in `../inkpaper`, the desktop tool in `../inkpaper-desktop`.
+Personal-scale device-cloud backend in Rust + axum: an admin API guarded by the single `ADMIN_TOKEN` **plus** console-account sessions (`POST /api/auth/*`, Argon2id passwords, per-account device ownership), and a device-facing sync endpoint `/api/sync` (per-device tokens, ETag/304 caching). Storage is sqlx's `Any` driver: SQLite by default (zero-config), or PostgreSQL when `DATABASE_URL` is a `postgres://` URL. The Vue 3 console `admin-ui/` is embedded into the binary at compile time via rust-embed. One of three repos: firmware + protocol docs live in `../inkpaper`, the desktop tool in `../inkpaper-desktop`.
 
 ## Critical gotchas
 
 - `build.rs` runs `npm run build` (in `admin-ui/`) on every `cargo build`/`cargo run` and panics if `admin-ui/node_modules` is missing - run `npm install --prefix admin-ui` once after cloning. UI changes are rebuilt automatically; before touching Rust, make sure node_modules still exists.
-- `ADMIN_TOKEN` is required or the server refuses to start; `.env` is loaded automatically by dotenvy from the working directory and is gitignored (never commit keys). Also `DATABASE_PATH` (default `inkpaper.sqlite3`) and `BIND_ADDR` (default `0.0.0.0:8080`).
+- `ADMIN_TOKEN` is required or the server refuses to start; `.env` is loaded automatically by dotenvy from the working directory and is gitignored (never commit keys). A single `DATABASE_URL` selects the backend (default `sqlite://inkpaper.sqlite3`; set `postgres://user:pass@host:5432/db` to switch to PostgreSQL - never log it, it may embed credentials). Also `BIND_ADDR` (default `0.0.0.0:8080`).
 - No test CI. Pre-commit verification: `cargo fmt --check && cargo clippy --all-targets && cargo test` (only the 2 unit tests in `db.rs`) plus `npm run build` in `admin-ui/` (= `vue-tsc --noEmit` + vite build). The only workflow is `.github/workflows/release.yml` (below).
 
 ## Releases
@@ -23,7 +23,8 @@ Personal-scale device-cloud backend in Rust + axum: an admin API guarded by the 
 
 ## Architecture
 
-- Entry chain: `src/main.rs` -> `src/routes.rs` (axum router; handlers return a concrete `Response`, auth is manual via a `HeaderMap` parameter) -> `src/db.rs` (SQLite behind a single shared `Arc<Mutex<Connection>>` - deliberately no connection pool; don't switch to sqlx/deadpool) -> `src/models.rs` (wire types). `src/auth.rs` has the Argon2id password hashing + username/password validation.
+- Entry chain: `src/main.rs` -> `src/routes.rs` (axum router; handlers return a concrete `Response`, auth is manual via a `HeaderMap` parameter) -> `src/db.rs` -> `src/models.rs` (wire types). `src/auth.rs` has the Argon2id password hashing + username/password validation.
+- **Storage (`src/db.rs`)**: sqlx `Any` pool - SQLite by default, PostgreSQL when the URL is `postgres://`. All handlers `await` sqlx calls (the old sync `rusqlite` behind `Arc<Mutex<Connection>>` is gone; sqlx pool `max_connections` is small (2), still far from needing deadpool). Data SQL is written with `?` placeholders for SQLite; `Db::adapt()` rewrites them to `$1, $2, …` for Postgres at runtime, because sqlx 0.8's Postgres driver does **not** translate `?` itself. Never write `$N` placeholders directly (SQLite rejects them), and never put `?` inside a SQL string literal (the adapter would miscount). DDL is emitted per-dialect in `open()` (`SQLITE_TABLES` vs `POSTGRES_TABLES`); Postgres integers are `BIGINT` so `try_get::<i64>` matches the SQLite decode. SQLite URLs default to `?mode=rwc` (sqlx 0.8 won't create a missing file otherwise).
 - Three trust domains share one router:
   - `ADMIN_TOKEN` (env, from `main.rs`) - full access to every device, including unowned ones. This is how `inkpaper-desktop` keeps working unchanged.
   - Console-account sessions (`/api/auth/login` / `/api/auth/register` return a bearer session token stored in the `sessions` table) - scoped to that account's own devices (`devices.account_id`); touching another account's device returns 404. `auth_context()` in `routes.rs` resolves which domain a request is in; `require_device_access()` additionally checks ownership for account sessions.

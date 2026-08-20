@@ -49,11 +49,13 @@ Env vars:
 | Var            | Default               | Purpose                                   |
 | -------------- | --------------------- | ----------------------------------------- |
 | `ADMIN_TOKEN`  | _(required)_          | Owner bearer token: full access to all devices & accounts |
-| `DATABASE_PATH`| `inkpaper.sqlite3`    | SQLite file location                      |
+| `DATABASE_URL` | `sqlite://inkpaper.sqlite3` | Backend selector: `sqlite://…` or `postgres://user:pass@host:5432/db` |
 | `BIND_ADDR`    | `0.0.0.0:8080`        | Listen address                            |
 
 `.env` is loaded from the working directory; existing process
-environment takes precedence.
+environment takes precedence. Set `DATABASE_URL` to a `postgres://` URL
+to use PostgreSQL instead of the default SQLite file (the schema is
+created automatically on first start).
 
 On first load the console offers **Create account**; open it in a browser
 at `http://<server>:8080/`, sign in with an account (or the `ADMIN_TOKEN`
