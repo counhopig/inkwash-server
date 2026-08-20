@@ -6,7 +6,20 @@ Personal-scale device-cloud backend in Rust + axum: admin API (single `ADMIN_TOK
 
 - `build.rs` runs `npm run build` (in `admin-ui/`) on every `cargo build`/`cargo run` and panics if `admin-ui/node_modules` is missing - run `npm install --prefix admin-ui` once after cloning. UI changes are rebuilt automatically; before touching Rust, make sure node_modules still exists.
 - `ADMIN_TOKEN` is required or the server refuses to start; `.env` is loaded automatically by dotenvy from the working directory and is gitignored (never commit keys). Also `DATABASE_PATH` (default `inkpaper.sqlite3`) and `BIND_ADDR` (default `0.0.0.0:8080`).
-- No CI. Pre-commit verification: `cargo fmt --check && cargo clippy --all-targets && cargo test` (only the 2 unit tests in `db.rs`) plus `npm run build` in `admin-ui/` (= `vue-tsc --noEmit` + vite build).
+- No test CI. Pre-commit verification: `cargo fmt --check && cargo clippy --all-targets && cargo test` (only the 2 unit tests in `db.rs`) plus `npm run build` in `admin-ui/` (= `vue-tsc --noEmit` + vite build). The only workflow is `.github/workflows/release.yml` (below).
+
+## Releases
+
+`.github/workflows/release.yml` builds Linux/macOS x86_64 binaries and **publishes automatically** (`draft: false`) whenever a `v*` tag is pushed to the `github` remote — no manual draft handling.
+
+- **Critical:** GitHub Actions runs the workflow file **at the tagged commit**, not at `main`. If you re-trigger a release by deleting + re-pushing a tag, the tag must point to a commit that already contains the latest workflow changes — otherwise the *old* workflow runs. Also delete the old release + remote tag first, because force-updating an existing tag does not reliably re-trigger the workflow:
+  ```bash
+  gh release delete v0.1.0 --repo counhopig/inkpaper-server --yes
+  git push github :refs/tags/v0.1.0
+  git tag -f v0.1.0 <commit-with-latest-workflow>
+  git push github v0.1.0
+  ```
+- Release check: `gh release view v0.1.0 --repo counhopig/inkpaper-server --json isDraft,assets` (expect `isDraft: false`, one asset per platform).
 
 ## Architecture
 
