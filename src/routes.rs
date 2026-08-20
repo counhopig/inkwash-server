@@ -117,7 +117,7 @@ async fn register_account(State(state): State<AppState>, Json(req): Json<AuthReq
     if let Err(msg) = crate::auth::validate_password(&req.password) {
         return bad_request(msg);
     }
-    if match db::find_account_by_username(&state.db, username) {
+    if match db::find_account_by_username(&state.db, username).await {
         Ok(v) => v,
         Err(err) => return internal_error(err),
     }
@@ -129,16 +129,16 @@ async fn register_account(State(state): State<AppState>, Json(req): Json<AuthReq
         Ok(h) => h,
         Err(err) => return internal_error(err),
     };
-    let account = match db::register_account(&state.db, username, &hash) {
+    let account = match db::register_account(&state.db, username, &hash).await {
         Ok(a) => a,
         Err(err) => return internal_error(err),
     };
-    issue_session(&state, account)
+    issue_session(&state, account).await
 }
 
 async fn login_account(State(state): State<AppState>, Json(req): Json<AuthRequest>) -> Response {
     let username = req.username.trim();
-    let stored = match db::find_account_by_username(&state.db, username) {
+    let stored = match db::find_account_by_username(&state.db, username).await {
         Ok(v) => v,
         Err(err) => return internal_error(err),
     };
@@ -159,18 +159,18 @@ async fn login_account(State(state): State<AppState>, Json(req): Json<AuthReques
             return (StatusCode::UNAUTHORIZED, "invalid username or password").into_response();
         }
     };
-    let account = match db::account_by_id(&state.db, account_id) {
+    let account = match db::account_by_id(&state.db, account_id).await {
         Ok(Some(a)) => a,
         Ok(None) => {
             return (StatusCode::UNAUTHORIZED, "invalid username or password").into_response()
         }
         Err(err) => return internal_error(err),
     };
-    issue_session(&state, account)
+    issue_session(&state, account).await
 }
 
-fn issue_session(state: &AppState, account: Account) -> Response {
-    let token = match db::create_session(&state.db, account.id) {
+async fn issue_session(state: &AppState, account: Account) -> Response {
+    let token = match db::create_session(&state.db, account.id).await {
         Ok(t) => t,
         Err(err) => return internal_error(err),
     };
@@ -189,7 +189,7 @@ async fn logout_account(State(state): State<AppState>, headers: HeaderMap) -> Re
     let Some(token) = bearer_token(&headers) else {
         return (StatusCode::NO_CONTENT).into_response();
     };
-    match db::delete_session(&state.db, token) {
+    match db::delete_session(&state.db, token).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => internal_error(err),
     }
@@ -198,18 +198,20 @@ async fn logout_account(State(state): State<AppState>, headers: HeaderMap) -> Re
 /// Validates a stored session token so the console can confirm it's still
 /// logged in on load. Also answers for the admin token.
 async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    match auth_context(&headers, &state) {
+    match auth_context(&headers, &state).await {
         Ok(AuthContext::Admin) => Json(serde_json::json!({ "kind": "admin" })).into_response(),
-        Ok(AuthContext::Account(account_id)) => match db::account_by_id(&state.db, account_id) {
-            Ok(Some(account)) => Json(serde_json::json!({
-                "kind": "account",
-                "account_id": account.id,
-                "username": account.username
-            }))
-            .into_response(),
-            Ok(None) => (StatusCode::UNAUTHORIZED, "invalid session").into_response(),
-            Err(err) => internal_error(err),
-        },
+        Ok(AuthContext::Account(account_id)) => {
+            match db::account_by_id(&state.db, account_id).await {
+                Ok(Some(account)) => Json(serde_json::json!({
+                    "kind": "account",
+                    "account_id": account.id,
+                    "username": account.username
+                }))
+                .into_response(),
+                Ok(None) => (StatusCode::UNAUTHORIZED, "invalid session").into_response(),
+                Err(err) => internal_error(err),
+            }
+        }
         Err(resp) => resp.into_response(),
     }
 }
@@ -219,7 +221,7 @@ async fn change_password(
     headers: HeaderMap,
     Json(req): Json<ChangePasswordRequest>,
 ) -> Response {
-    let ctx = match auth_context(&headers, &state) {
+    let ctx = match auth_context(&headers, &state).await {
         Ok(ctx) => ctx,
         Err(resp) => return resp.into_response(),
     };
@@ -232,12 +234,12 @@ async fn change_password(
         )
             .into_response();
     };
-    let stored = match db::account_by_id(&state.db, account_id) {
+    let stored = match db::account_by_id(&state.db, account_id).await {
         Ok(Some(a)) => a,
         Ok(None) => return (StatusCode::UNAUTHORIZED, "invalid session").into_response(),
         Err(err) => return internal_error(err),
     };
-    let (_, hash) = match db::find_account_by_username(&state.db, &stored.username) {
+    let (_, hash) = match db::find_account_by_username(&state.db, &stored.username).await {
         Ok(Some(v)) => v,
         Ok(None) => return (StatusCode::UNAUTHORIZED, "invalid session").into_response(),
         Err(err) => return internal_error(err),
@@ -252,7 +254,7 @@ async fn change_password(
         Ok(h) => h,
         Err(err) => return internal_error(err),
     };
-    match db::update_account_password(&state.db, account_id, &new_hash) {
+    match db::update_account_password(&state.db, account_id, &new_hash).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => internal_error(err),
     }
@@ -303,7 +305,7 @@ enum AuthContext {
     Account(i64),
 }
 
-fn auth_context(
+async fn auth_context(
     headers: &HeaderMap,
     state: &AppState,
 ) -> Result<AuthContext, (StatusCode, &'static str)> {
@@ -313,7 +315,7 @@ fn auth_context(
     if token == state.admin_token {
         return Ok(AuthContext::Admin);
     }
-    match db::find_session(&state.db, token) {
+    match db::find_session(&state.db, token).await {
         Ok(Some(account_id)) => Ok(AuthContext::Account(account_id)),
         Ok(None) => Err((StatusCode::UNAUTHORIZED, "missing or invalid credentials")),
         Err(err) => {
@@ -327,16 +329,18 @@ fn auth_context(
 /// `device_id`. The admin token may access any device. Returns the resolved
 /// context so the caller knows whether it is managing another account's
 /// device (relevant for `register_device`, which must attach ownership).
-fn require_device_access(
+async fn require_device_access(
     headers: &HeaderMap,
     state: &AppState,
     device_id: &str,
 ) -> Result<AuthContext, Box<Response>> {
-    let ctx = auth_context(headers, state).map_err(|e| Box::new(e.into_response()))?;
+    let ctx = auth_context(headers, state)
+        .await
+        .map_err(|e| Box::new(e.into_response()))?;
     match ctx {
         AuthContext::Admin => Ok(ctx),
         AuthContext::Account(account_id) => {
-            match db::device_owned_by(&state.db, device_id, account_id) {
+            match db::device_owned_by(&state.db, device_id, account_id).await {
                 Ok(true) => Ok(ctx),
                 Ok(false) => Err(Box::new(
                     (StatusCode::NOT_FOUND, "device not found").into_response(),
@@ -356,11 +360,11 @@ fn internal_error(err: anyhow::Error) -> Response {
 
 /// The `ADMIN_TOKEN` is the owner credential; account sessions are not
 /// allowed past this gate.
-fn require_admin_only(
+async fn require_admin_only(
     headers: &HeaderMap,
     state: &AppState,
 ) -> Result<(), (StatusCode, &'static str)> {
-    match auth_context(headers, state) {
+    match auth_context(headers, state).await {
         Ok(AuthContext::Admin) => Ok(()),
         Ok(AuthContext::Account(_)) => Err((StatusCode::FORBIDDEN, "admin token required")),
         Err(resp) => Err(resp),
@@ -368,10 +372,10 @@ fn require_admin_only(
 }
 
 async fn admin_list_accounts(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(resp) = require_admin_only(&headers, &state) {
+    if let Err(resp) = require_admin_only(&headers, &state).await {
         return resp.into_response();
     }
-    match db::list_accounts(&state.db) {
+    match db::list_accounts(&state.db).await {
         Ok(accounts) => Json(accounts).into_response(),
         Err(err) => internal_error(err),
     }
@@ -382,10 +386,10 @@ async fn admin_delete_account(
     headers: HeaderMap,
     Path(account_id): Path<i64>,
 ) -> Response {
-    if let Err(resp) = require_admin_only(&headers, &state) {
+    if let Err(resp) = require_admin_only(&headers, &state).await {
         return resp.into_response();
     }
-    match db::delete_account(&state.db, account_id) {
+    match db::delete_account(&state.db, account_id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "account not found").into_response(),
         Err(err) => internal_error(err),
@@ -398,7 +402,7 @@ async fn admin_reset_password(
     Path(account_id): Path<i64>,
     Json(req): Json<AdminResetPasswordRequest>,
 ) -> Response {
-    if let Err(resp) = require_admin_only(&headers, &state) {
+    if let Err(resp) = require_admin_only(&headers, &state).await {
         return resp.into_response();
     }
     if let Err(msg) = crate::auth::validate_password(&req.new_password) {
@@ -408,7 +412,7 @@ async fn admin_reset_password(
         Ok(h) => h,
         Err(err) => return internal_error(err),
     };
-    match db::update_account_password(&state.db, account_id, &hash) {
+    match db::update_account_password(&state.db, account_id, &hash).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => internal_error(err),
     }
@@ -421,7 +425,7 @@ async fn device_sync(State(state): State<AppState>, headers: HeaderMap) -> Respo
         tracing::warn!("sync rejected: missing bearer token");
         return (StatusCode::UNAUTHORIZED, "missing bearer token").into_response();
     };
-    let (device_id, version) = match db::find_device_by_token(&state.db, token) {
+    let (device_id, version) = match db::find_device_by_token(&state.db, token).await {
         Ok(Some(v)) => v,
         Ok(None) => {
             tracing::warn!("sync rejected: unknown device token");
@@ -441,11 +445,11 @@ async fn device_sync(State(state): State<AppState>, headers: HeaderMap) -> Respo
         return StatusCode::NOT_MODIFIED.into_response();
     }
 
-    let alarms = match db::list_alarms(&state.db, &device_id) {
+    let alarms = match db::list_alarms(&state.db, &device_id).await {
         Ok(v) => v,
         Err(err) => return internal_error(err),
     };
-    let todos = match db::list_todos(&state.db, &device_id) {
+    let todos = match db::list_todos(&state.db, &device_id).await {
         Ok(v) => v,
         Err(err) => return internal_error(err),
     };
@@ -469,20 +473,20 @@ async fn device_push_sync(
     let Some(token) = bearer_token(&headers) else {
         return (StatusCode::UNAUTHORIZED, "missing bearer token").into_response();
     };
-    let device_id = match db::find_device_by_token(&state.db, token) {
+    let device_id = match db::find_device_by_token(&state.db, token).await {
         Ok(Some((id, _))) => id,
         Ok(None) => return (StatusCode::UNAUTHORIZED, "unknown device token").into_response(),
         Err(err) => return internal_error(err),
     };
-    let version = match db::merge_device_state(&state.db, &device_id, &req) {
+    let version = match db::merge_device_state(&state.db, &device_id, &req).await {
         Ok(version) => version,
         Err(err) => return internal_error(err),
     };
-    let alarms = match db::list_alarms(&state.db, &device_id) {
+    let alarms = match db::list_alarms(&state.db, &device_id).await {
         Ok(value) => value,
         Err(err) => return internal_error(err),
     };
-    let todos = match db::list_todos(&state.db, &device_id) {
+    let todos = match db::list_todos(&state.db, &device_id).await {
         Ok(value) => value,
         Err(err) => return internal_error(err),
     };
@@ -509,7 +513,7 @@ async fn register_device(
     headers: HeaderMap,
     Json(req): Json<RegisterDeviceRequest>,
 ) -> Response {
-    let ctx = match auth_context(&headers, &state) {
+    let ctx = match auth_context(&headers, &state).await {
         Ok(ctx) => ctx,
         Err(resp) => return resp.into_response(),
     };
@@ -520,20 +524,20 @@ async fn register_device(
         AuthContext::Admin => None,
         AuthContext::Account(id) => Some(id),
     };
-    match db::register_device(&state.db, &req.name, account_id) {
+    match db::register_device(&state.db, &req.name, account_id).await {
         Ok(device) => (StatusCode::CREATED, Json(device)).into_response(),
         Err(err) => internal_error(err),
     }
 }
 
 async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let ctx = match auth_context(&headers, &state) {
+    let ctx = match auth_context(&headers, &state).await {
         Ok(ctx) => ctx,
         Err(resp) => return resp.into_response(),
     };
     let devices = match ctx {
-        AuthContext::Admin => db::list_devices(&state.db),
-        AuthContext::Account(account_id) => db::list_account_devices(&state.db, account_id),
+        AuthContext::Admin => db::list_devices(&state.db).await,
+        AuthContext::Account(account_id) => db::list_account_devices(&state.db, account_id).await,
     };
     match devices {
         Ok(devices) => Json(devices).into_response(),
@@ -546,11 +550,11 @@ async fn delete_device(
     headers: HeaderMap,
     Path(device_id): Path<String>,
 ) -> Response {
-    match require_device_access(&headers, &state, &device_id) {
+    match require_device_access(&headers, &state, &device_id).await {
         Ok(_) => {}
         Err(resp) => return *resp,
     }
-    match db::delete_device(&state.db, &device_id) {
+    match db::delete_device(&state.db, &device_id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => internal_error(err),
     }
@@ -563,10 +567,10 @@ async fn list_alarms(
     headers: HeaderMap,
     Path(device_id): Path<String>,
 ) -> Response {
-    if let Err(resp) = require_device_access(&headers, &state, &device_id) {
+    if let Err(resp) = require_device_access(&headers, &state, &device_id).await {
         return *resp;
     }
-    match db::list_alarms(&state.db, &device_id) {
+    match db::list_alarms(&state.db, &device_id).await {
         Ok(alarms) => Json(alarms).into_response(),
         Err(err) => internal_error(err),
     }
@@ -578,13 +582,13 @@ async fn create_alarm(
     Path(device_id): Path<String>,
     Json(req): Json<UpsertAlarmRequest>,
 ) -> Response {
-    if let Err(resp) = require_device_access(&headers, &state, &device_id) {
+    if let Err(resp) = require_device_access(&headers, &state, &device_id).await {
         return *resp;
     }
     if let Err(msg) = validate_alarm(&req) {
         return bad_request(msg);
     }
-    match db::upsert_alarm(&state.db, &device_id, None, &req) {
+    match db::upsert_alarm(&state.db, &device_id, None, &req).await {
         Ok(id) => (StatusCode::CREATED, Json(serde_json::json!({ "id": id }))).into_response(),
         Err(err) => internal_error(err),
     }
@@ -596,13 +600,13 @@ async fn update_alarm(
     Path((device_id, alarm_id)): Path<(String, u8)>,
     Json(req): Json<UpsertAlarmRequest>,
 ) -> Response {
-    if let Err(resp) = require_device_access(&headers, &state, &device_id) {
+    if let Err(resp) = require_device_access(&headers, &state, &device_id).await {
         return *resp;
     }
     if let Err(msg) = validate_alarm(&req) {
         return bad_request(msg);
     }
-    match db::upsert_alarm(&state.db, &device_id, Some(alarm_id), &req) {
+    match db::upsert_alarm(&state.db, &device_id, Some(alarm_id), &req).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => internal_error(err),
     }
@@ -613,10 +617,10 @@ async fn clear_alarms(
     headers: HeaderMap,
     Path(device_id): Path<String>,
 ) -> Response {
-    if let Err(resp) = require_device_access(&headers, &state, &device_id) {
+    if let Err(resp) = require_device_access(&headers, &state, &device_id).await {
         return *resp;
     }
-    match db::clear_alarms(&state.db, &device_id) {
+    match db::clear_alarms(&state.db, &device_id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => internal_error(err),
     }
@@ -627,10 +631,10 @@ async fn delete_alarm(
     headers: HeaderMap,
     Path((device_id, alarm_id)): Path<(String, u8)>,
 ) -> Response {
-    if let Err(resp) = require_device_access(&headers, &state, &device_id) {
+    if let Err(resp) = require_device_access(&headers, &state, &device_id).await {
         return *resp;
     }
-    match db::delete_alarm(&state.db, &device_id, alarm_id) {
+    match db::delete_alarm(&state.db, &device_id, alarm_id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => internal_error(err),
     }
@@ -643,10 +647,10 @@ async fn list_todos(
     headers: HeaderMap,
     Path(device_id): Path<String>,
 ) -> Response {
-    if let Err(resp) = require_device_access(&headers, &state, &device_id) {
+    if let Err(resp) = require_device_access(&headers, &state, &device_id).await {
         return *resp;
     }
-    match db::list_todos(&state.db, &device_id) {
+    match db::list_todos(&state.db, &device_id).await {
         Ok(todos) => Json(todos).into_response(),
         Err(err) => internal_error(err),
     }
@@ -658,13 +662,13 @@ async fn create_todo(
     Path(device_id): Path<String>,
     Json(req): Json<UpsertTodoRequest>,
 ) -> Response {
-    if let Err(resp) = require_device_access(&headers, &state, &device_id) {
+    if let Err(resp) = require_device_access(&headers, &state, &device_id).await {
         return *resp;
     }
     if let Err(msg) = validate_todo(&req) {
         return bad_request(msg);
     }
-    match db::upsert_todo(&state.db, &device_id, None, &req) {
+    match db::upsert_todo(&state.db, &device_id, None, &req).await {
         Ok(id) => (StatusCode::CREATED, Json(serde_json::json!({ "id": id }))).into_response(),
         Err(err) => internal_error(err),
     }
@@ -676,13 +680,13 @@ async fn update_todo(
     Path((device_id, todo_id)): Path<(String, u8)>,
     Json(req): Json<UpsertTodoRequest>,
 ) -> Response {
-    if let Err(resp) = require_device_access(&headers, &state, &device_id) {
+    if let Err(resp) = require_device_access(&headers, &state, &device_id).await {
         return *resp;
     }
     if let Err(msg) = validate_todo(&req) {
         return bad_request(msg);
     }
-    match db::upsert_todo(&state.db, &device_id, Some(todo_id), &req) {
+    match db::upsert_todo(&state.db, &device_id, Some(todo_id), &req).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => internal_error(err),
     }
@@ -693,10 +697,10 @@ async fn clear_todos(
     headers: HeaderMap,
     Path(device_id): Path<String>,
 ) -> Response {
-    if let Err(resp) = require_device_access(&headers, &state, &device_id) {
+    if let Err(resp) = require_device_access(&headers, &state, &device_id).await {
         return *resp;
     }
-    match db::clear_todos(&state.db, &device_id) {
+    match db::clear_todos(&state.db, &device_id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => internal_error(err),
     }
@@ -707,10 +711,10 @@ async fn delete_todo(
     headers: HeaderMap,
     Path((device_id, todo_id)): Path<(String, u8)>,
 ) -> Response {
-    if let Err(resp) = require_device_access(&headers, &state, &device_id) {
+    if let Err(resp) = require_device_access(&headers, &state, &device_id).await {
         return *resp;
     }
-    match db::delete_todo(&state.db, &device_id, todo_id) {
+    match db::delete_todo(&state.db, &device_id, todo_id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => internal_error(err),
     }

@@ -1,16 +1,19 @@
-//! SQLite storage. A single `Arc<Mutex<Connection>>` is shared across axum
-//! handlers rather than a connection pool or async driver - this is a
-//! personal-scale server (one owner, a handful of devices), request volume
-//! is trivially low, and `rusqlite` calls are fast enough that blocking the
-//! handler task briefly is a fine trade for not pulling in `sqlx`/deadpool
-//! and its offline-query-cache setup for a project this size.
-
-use std::sync::{Arc, Mutex};
+//! Storage behind sqlx's `Any` driver, so one codebase serves both SQLite
+//! (default, zero-config `sqlite://` URL) and PostgreSQL (via a
+//! `postgres://` `DATABASE_URL`). The backend is selected at `open()` time
+//! from the URL; DDL is emitted per-dialect, while the data queries below
+//! use sqlx's cross-dialect `?` placeholders and `i64` for every integer so
+//! one SQL body works on both backends.
+//!
+//! A small connection pool (default max 2) replaces the old single
+//! `Arc<Mutex<Connection>>` - still far from anything you'd need deadpool
+//! for, but it's what sqlx gives us for free.
 
 use anyhow::{anyhow, Context, Result};
 use rand::distributions::Alphanumeric;
 use rand::Rng;
-use rusqlite::{params, Connection};
+use sqlx::any::AnyPoolOptions;
+use sqlx::{Any, AnyPool, Executor, Row};
 use uuid::Uuid;
 
 use crate::models::{
@@ -18,9 +21,47 @@ use crate::models::{
     UpsertAlarmRequest, UpsertTodoRequest,
 };
 
-pub type Db = Arc<Mutex<Connection>>;
+/// Wraps the sqlx `Any` pool plus the backend flag. Data SQL is written with
+/// `?` placeholders (SQLite-native); `adapt()` rewrites them to Postgres'
+/// `$1, $2, …` form at runtime, since sqlx 0.8's Postgres driver does not
+/// translate `?` itself.
+#[derive(Clone)]
+pub struct Db {
+    pool: AnyPool,
+    postgres: bool,
+}
 
-const DEVICES_TABLE: &str = "
+impl Db {
+    fn adapt(&self, sql: &str) -> String {
+        if !self.postgres {
+            return sql.to_string();
+        }
+        let mut out = String::with_capacity(sql.len() + 8);
+        let mut n = 0;
+        for c in sql.chars() {
+            if c == '?' {
+                n += 1;
+                out.push_str(&format!("${n}"));
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+}
+
+const SQLITE_TABLES: &str = "
+    CREATE TABLE IF NOT EXISTS accounts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS sessions (
+        token TEXT PRIMARY KEY,
+        account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        created_at INTEGER NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS devices (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -28,8 +69,7 @@ const DEVICES_TABLE: &str = "
         version INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL,
         account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE
-    )";
-const ALARMS_TABLE: &str = "
+    );
     CREATE TABLE IF NOT EXISTS alarms (
         device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
         local_id INTEGER NOT NULL,
@@ -43,8 +83,7 @@ const ALARMS_TABLE: &str = "
         enabled INTEGER NOT NULL,
         label TEXT NOT NULL,
         PRIMARY KEY (device_id, local_id)
-    )";
-const TODOS_TABLE: &str = "
+    );
     CREATE TABLE IF NOT EXISTS todos (
         device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
         local_id INTEGER NOT NULL,
@@ -57,47 +96,124 @@ const TODOS_TABLE: &str = "
         repeat_kind TEXT,
         repeat_days TEXT,
         PRIMARY KEY (device_id, local_id)
-    )";
-const ACCOUNTS_TABLE: &str = "
+    );";
+
+const POSTGRES_TABLES: &str = "
     CREATE TABLE IF NOT EXISTS accounts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id BIGSERIAL PRIMARY KEY,
         username TEXT NOT NULL UNIQUE,
         password_hash TEXT NOT NULL,
-        created_at INTEGER NOT NULL
-    )";
-const SESSIONS_TABLE: &str = "
+        created_at BIGINT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS sessions (
         token TEXT PRIMARY KEY,
-        account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-        created_at INTEGER NOT NULL
-    )";
+        account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        created_at BIGINT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS devices (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        token TEXT NOT NULL UNIQUE,
+        version BIGINT NOT NULL DEFAULT 0,
+        created_at BIGINT NOT NULL,
+        account_id BIGINT REFERENCES accounts(id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS alarms (
+        device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+        local_id BIGINT NOT NULL,
+        hour BIGINT NOT NULL,
+        minute BIGINT NOT NULL,
+        repeat_kind TEXT NOT NULL,
+        once_year BIGINT,
+        once_month BIGINT,
+        once_day BIGINT,
+        repeat_days TEXT,
+        enabled BIGINT NOT NULL,
+        label TEXT NOT NULL,
+        PRIMARY KEY (device_id, local_id)
+    );
+    CREATE TABLE IF NOT EXISTS todos (
+        device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+        local_id BIGINT NOT NULL,
+        text TEXT NOT NULL,
+        done BIGINT NOT NULL,
+        importance TEXT NOT NULL DEFAULT 'medium',
+        due_year BIGINT,
+        due_month BIGINT,
+        due_day BIGINT,
+        repeat_kind TEXT,
+        repeat_days TEXT,
+        PRIMARY KEY (device_id, local_id)
+    );";
 
-pub fn open(path: &str) -> Result<Db> {
-    let mut conn = Connection::open(path).with_context(|| format!("failed to open {path}"))?;
-    conn.pragma_update(None, "foreign_keys", true)?;
-    conn.execute_batch(&format!(
-        "{ACCOUNTS_TABLE}; {SESSIONS_TABLE}; {DEVICES_TABLE}; {ALARMS_TABLE}; {TODOS_TABLE};"
-    ))?;
-    migrate_legacy_integer_ids(&mut conn)?;
-    // Databases created before these columns existed are missing them;
-    // `CREATE TABLE IF NOT EXISTS` never adds columns, so add them
-    // explicitly and ignore the duplicate-column error.
-    for stmt in [
-        "ALTER TABLE todos ADD COLUMN importance TEXT NOT NULL DEFAULT 'medium'",
-        "ALTER TABLE todos ADD COLUMN due_month INTEGER",
-        "ALTER TABLE todos ADD COLUMN due_day INTEGER",
-        "ALTER TABLE todos ADD COLUMN due_year INTEGER",
-        "ALTER TABLE todos ADD COLUMN repeat_kind TEXT",
-        "ALTER TABLE todos ADD COLUMN repeat_days TEXT",
-        "ALTER TABLE alarms ADD COLUMN repeat_days TEXT",
-        "ALTER TABLE devices ADD COLUMN account_id INTEGER",
-    ] {
-        let _ = conn.execute(stmt, []);
+/// Opens (creating the schema if needed) the database at `url`, which may be
+/// `sqlite://...` (or a bare SQLite file path) or `postgres://...`.
+/// `max_connections` sizes the pool; in-memory SQLite databases must use 1
+/// so every query hits the same connection (memory DBs are per-connection).
+pub async fn open(url: &str, max_connections: u32) -> Result<Db> {
+    sqlx::any::install_default_drivers();
+    let is_postgres = url.starts_with("postgres://") || url.starts_with("postgresql://");
+
+    // sqlx 0.8 defaults to *not* creating a missing SQLite file, whereas the
+    // old rusqlite backend created the database on open. Default to
+    // `mode=rwc` (read-write + create) unless the caller pinned a mode.
+    let mut url = url.to_string();
+    if !is_postgres && !url.contains("mode=") {
+        url.push_str(if url.contains('?') {
+            "&mode=rwc"
+        } else {
+            "?mode=rwc"
+        });
     }
-    Ok(Arc::new(Mutex::new(conn)))
+
+    let mut options = AnyPoolOptions::new().max_connections(max_connections);
+    if !is_postgres {
+        // SQLite foreign keys are off per-connection by default; make sure
+        // every pooled connection enforces them so cascades behave.
+        options = options.after_connect(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query("PRAGMA foreign_keys = ON")
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(())
+            })
+        });
+    }
+    let pool = options
+        .connect(&url)
+        .await
+        .with_context(|| format!("failed to connect to database at {url}"))?;
+    let db = Db {
+        pool,
+        postgres: is_postgres,
+    };
+
+    if is_postgres {
+        sqlx::raw_sql(POSTGRES_TABLES).execute(&db.pool).await?;
+    } else {
+        sqlx::raw_sql(SQLITE_TABLES).execute(&db.pool).await?;
+        migrate_legacy_integer_ids(&db).await?;
+        // Databases created before these columns existed are missing them;
+        // `CREATE TABLE IF NOT EXISTS` never adds columns, so add them
+        // explicitly and ignore the duplicate-column error.
+        for stmt in [
+            "ALTER TABLE todos ADD COLUMN importance TEXT NOT NULL DEFAULT 'medium'",
+            "ALTER TABLE todos ADD COLUMN due_month INTEGER",
+            "ALTER TABLE todos ADD COLUMN due_day INTEGER",
+            "ALTER TABLE todos ADD COLUMN due_year INTEGER",
+            "ALTER TABLE todos ADD COLUMN repeat_kind TEXT",
+            "ALTER TABLE todos ADD COLUMN repeat_days TEXT",
+            "ALTER TABLE alarms ADD COLUMN repeat_days TEXT",
+            "ALTER TABLE devices ADD COLUMN account_id INTEGER",
+        ] {
+            let _ = sqlx::raw_sql(stmt).execute(&db.pool).await;
+        }
+    }
+
+    Ok(db)
 }
 
-/// Legacy pre-UUID `alarms` row shape used only by the migration snapshot.
+/// Legacy pre-UUID `alarms` row shape used only by the SQLite migration.
 type LegacyAlarmRow = (
     i64,
     i64,
@@ -111,74 +227,90 @@ type LegacyAlarmRow = (
     String,
 );
 
-/// Migrates databases from the pre-UUID era where `devices.id` was an
-/// `INTEGER PRIMARY KEY AUTOINCREMENT` and `alarms`/`todos` referenced it
-/// with an INTEGER `device_id`. Personal-scale data (a handful of devices,
-/// each with a handful of records) is copied over row by row; the device
-/// auth token is preserved, so devices keep syncing without re-registering.
-fn migrate_legacy_integer_ids(conn: &mut Connection) -> Result<()> {
-    let legacy: i64 = conn.query_row(
+/// Migrates SQLite databases from the pre-UUID era where `devices.id` was an
+/// `INTEGER PRIMARY KEY AUTOINCREMENT` and `alarms`/`todos` referenced it with
+/// an INTEGER `device_id`. Personal-scale data (a handful of devices) is
+/// copied over row by row; the device auth token is preserved, so devices
+/// keep syncing without re-registering. Only meaningful for SQLite.
+async fn migrate_legacy_integer_ids(db: &Db) -> Result<()> {
+    let legacy: i64 = sqlx::query_scalar(&db.adapt(
         "SELECT COUNT(*) FROM pragma_table_info('devices') WHERE name = 'id' AND type = 'INTEGER'",
-        [],
-        |row| row.get(0),
-    )?;
+    ))
+    .fetch_one(&db.pool)
+    .await?;
     if legacy == 0 {
         return Ok(());
     }
     tracing::info!("detected pre-UUID device ids; migrating to UUID keys");
 
-    // Snapshot the legacy rows, then rename the old tables out of the way.
-    let devices: Vec<(i64, String, String, i64, i64)> = conn
-        .prepare("SELECT id, name, token, version, created_at FROM devices")?
-        .query_map([], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let alarms: Vec<LegacyAlarmRow> =
-        conn.prepare(
-            "SELECT device_id, local_id, hour, minute, repeat_kind, once_year, once_month, once_day, enabled, label FROM alarms",
-        )?
-        .query_map([], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?,
-                row.get(7)?,
-                row.get(8)?,
-                row.get(9)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let todos: Vec<(i64, i64, String, i64)> = conn
-        .prepare("SELECT device_id, local_id, text, done FROM todos")?
-        .query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut tx = db.pool.begin().await?;
+    let devices: Vec<(i64, String, String, i64, i64)> = {
+        let rows =
+            sqlx::query(&db.adapt("SELECT id, name, token, version, created_at FROM devices"))
+                .fetch_all(&mut *tx)
+                .await?;
+        rows.into_iter()
+            .map(|r| {
+                Ok((
+                    r.try_get::<i64, _>(0)?,
+                    r.try_get::<String, _>(1)?,
+                    r.try_get::<String, _>(2)?,
+                    r.try_get::<i64, _>(3)?,
+                    r.try_get::<i64, _>(4)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    let alarms: Vec<LegacyAlarmRow> = {
+        let rows = sqlx::query(&db.adapt("SELECT device_id, local_id, hour, minute, repeat_kind, once_year, once_month, once_day, enabled, label FROM alarms"))
+        .fetch_all(&mut *tx)
+        .await?;
+        rows.into_iter()
+            .map(|r| {
+                Ok((
+                    r.try_get::<i64, _>(0)?,
+                    r.try_get::<i64, _>(1)?,
+                    r.try_get::<i64, _>(2)?,
+                    r.try_get::<i64, _>(3)?,
+                    r.try_get::<String, _>(4)?,
+                    r.try_get::<Option<i64>, _>(5)?,
+                    r.try_get::<Option<i64>, _>(6)?,
+                    r.try_get::<Option<i64>, _>(7)?,
+                    r.try_get::<i64, _>(8)?,
+                    r.try_get::<String, _>(9)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    let todos: Vec<(i64, i64, String, i64)> = {
+        let rows = sqlx::query(&db.adapt("SELECT device_id, local_id, text, done FROM todos"))
+            .fetch_all(&mut *tx)
+            .await?;
+        rows.into_iter()
+            .map(|r| Ok((r.try_get(0)?, r.try_get(1)?, r.try_get(2)?, r.try_get(3)?)))
+            .collect::<Result<Vec<_>>>()?
+    };
 
-    conn.execute_batch(&format!(
-        "DROP TABLE alarms; DROP TABLE todos; DROP TABLE devices;
-         {DEVICES_TABLE}; {ALARMS_TABLE}; {TODOS_TABLE};"
-    ))?;
+    sqlx::raw_sql("DROP TABLE alarms; DROP TABLE todos; DROP TABLE devices;")
+        .execute(&mut *tx)
+        .await?;
+    // Recreate with the UUID schema (SQLite dialect - this path is SQLite-only).
+    sqlx::raw_sql(SQLITE_TABLES).execute(&mut *tx).await?;
 
     let mut id_map = std::collections::HashMap::new();
     for (old_id, name, token, version, created_at) in &devices {
         let new_id = Uuid::new_v4().to_string();
         id_map.insert(*old_id, new_id.clone());
-        conn.execute(
-            "INSERT INTO devices (id, name, token, version, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![new_id, name, token, version, created_at],
-        )?;
+        sqlx::query(&db.adapt(
+            "INSERT INTO devices (id, name, token, version, created_at) VALUES (?, ?, ?, ?, ?)",
+        ))
+        .bind(&new_id)
+        .bind(name)
+        .bind(token)
+        .bind(version)
+        .bind(created_at)
+        .execute(&mut *tx)
+        .await?;
     }
     for (
         device_id,
@@ -196,32 +328,36 @@ fn migrate_legacy_integer_ids(conn: &mut Connection) -> Result<()> {
         let Some(new_device_id) = id_map.get(device_id) else {
             continue;
         };
-        conn.execute(
-            "INSERT INTO alarms (device_id, local_id, hour, minute, repeat_kind, once_year, once_month, once_day, enabled, label)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                new_device_id,
-                local_id,
-                hour,
-                minute,
-                repeat_kind,
-                once_year,
-                once_month,
-                once_day,
-                enabled,
-                label
-            ],
-        )?;
+        sqlx::query(&db.adapt("INSERT INTO alarms (device_id, local_id, hour, minute, repeat_kind, once_year, once_month, once_day, enabled, label)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+        .bind(new_device_id)
+        .bind(local_id)
+        .bind(hour)
+        .bind(minute)
+        .bind(repeat_kind)
+        .bind(once_year)
+        .bind(once_month)
+        .bind(once_day)
+        .bind(enabled)
+        .bind(label)
+        .execute(&mut *tx)
+        .await?;
     }
     for (device_id, local_id, text, done) in &todos {
         let Some(new_device_id) = id_map.get(device_id) else {
             continue;
         };
-        conn.execute(
-            "INSERT INTO todos (device_id, local_id, text, done) VALUES (?1, ?2, ?3, ?4)",
-            params![new_device_id, local_id, text, done],
-        )?;
+        sqlx::query(
+            &db.adapt("INSERT INTO todos (device_id, local_id, text, done) VALUES (?, ?, ?, ?)"),
+        )
+        .bind(new_device_id)
+        .bind(local_id)
+        .bind(text)
+        .bind(done)
+        .execute(&mut *tx)
+        .await?;
     }
+    tx.commit().await?;
     tracing::info!("migrated {} devices to UUID ids", devices.len());
     Ok(())
 }
@@ -234,21 +370,24 @@ fn new_token() -> String {
         .collect()
 }
 
-/// Registers a new device and returns it with its token populated. The
-/// token is a bearer credential (see `docs/sync-api.md`'s Security
-/// section in the firmware repo) - only ever returned here, at creation
-/// time; `list_devices` omits it, so losing it means re-registering.
-/// `account_id: None` creates an unowned device (only reachable with the
-/// `ADMIN_TOKEN`); `Some` ties the device to a console account.
-pub fn register_device(db: &Db, name: &str, account_id: Option<i64>) -> Result<Device> {
-    let conn = db.lock().unwrap();
+/// Registers a new device and returns it with its token populated. The token
+/// is a bearer credential (see `docs/sync-api.md`'s Security section in the
+/// firmware repo) - only ever returned here, at creation time;
+/// `list_devices` omits it, so losing it means re-registering. `account_id:
+/// None` creates an unowned device (only reachable with the `ADMIN_TOKEN`);
+/// `Some` ties the device to a console account.
+pub async fn register_device(db: &Db, name: &str, account_id: Option<i64>) -> Result<Device> {
     let token = new_token();
     let now = now_unix();
     let id = Uuid::new_v4().to_string();
-    conn.execute(
-        "INSERT INTO devices (id, name, token, version, created_at, account_id) VALUES (?1, ?2, ?3, 0, ?4, ?5)",
-        params![id, name, token, now, account_id],
-    )?;
+    sqlx::query(&db.adapt("INSERT INTO devices (id, name, token, version, created_at, account_id) VALUES (?, ?, ?, 0, ?, ?)"))
+    .bind(&id)
+    .bind(name)
+    .bind(&token)
+    .bind(now)
+    .bind(account_id)
+    .execute(&db.pool)
+    .await?;
     Ok(Device {
         id,
         name: name.to_string(),
@@ -256,289 +395,182 @@ pub fn register_device(db: &Db, name: &str, account_id: Option<i64>) -> Result<D
     })
 }
 
-pub fn list_devices(db: &Db) -> Result<Vec<Device>> {
-    let conn = db.lock().unwrap();
-    let mut stmt = conn.prepare("SELECT id, name FROM devices ORDER BY name")?;
-    let rows = stmt
-        .query_map([], |row| {
+pub async fn list_devices(db: &Db) -> Result<Vec<Device>> {
+    let rows = sqlx::query(&db.adapt("SELECT id, name FROM devices ORDER BY name"))
+        .fetch_all(&db.pool)
+        .await?;
+    rows.into_iter()
+        .map(|r| {
             Ok(Device {
-                id: row.get(0)?,
-                name: row.get(1)?,
+                id: r.try_get(0)?,
+                name: r.try_get(1)?,
                 token: None,
             })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+        })
+        .collect()
 }
 
 /// Devices owned by one console account (for `GET /api/devices` when the
 /// caller is an account session rather than the admin token).
-pub fn list_account_devices(db: &Db, account_id: i64) -> Result<Vec<Device>> {
-    let conn = db.lock().unwrap();
-    let mut stmt =
-        conn.prepare("SELECT id, name FROM devices WHERE account_id = ?1 ORDER BY name")?;
-    let rows = stmt
-        .query_map(params![account_id], |row| {
+pub async fn list_account_devices(db: &Db, account_id: i64) -> Result<Vec<Device>> {
+    let rows =
+        sqlx::query(&db.adapt("SELECT id, name FROM devices WHERE account_id = ? ORDER BY name"))
+            .bind(account_id)
+            .fetch_all(&db.pool)
+            .await?;
+    rows.into_iter()
+        .map(|r| {
             Ok(Device {
-                id: row.get(0)?,
-                name: row.get(1)?,
+                id: r.try_get(0)?,
+                name: r.try_get(1)?,
                 token: None,
             })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+        })
+        .collect()
 }
 
-/// Whether `device_id` exists and is owned by `account_id`. Used to scope
-/// alarm/todo routes to an account's own devices.
-pub fn device_owned_by(db: &Db, device_id: &str, account_id: i64) -> Result<bool> {
-    let conn = db.lock().unwrap();
-    conn.query_row(
-        "SELECT COUNT(*) FROM devices WHERE id = ?1 AND account_id = ?2",
-        params![device_id, account_id],
-        |row| row.get::<_, i64>(0),
+/// Whether `device_id` exists and is owned by `account_id`.
+pub async fn device_owned_by(db: &Db, device_id: &str, account_id: i64) -> Result<bool> {
+    let count: i64 = sqlx::query_scalar(
+        &db.adapt("SELECT COUNT(*) FROM devices WHERE id = ? AND account_id = ?"),
     )
-    .map(|count| count > 0)
-    .map_err(Into::into)
+    .bind(device_id)
+    .bind(account_id)
+    .fetch_one(&db.pool)
+    .await?;
+    Ok(count > 0)
 }
 
-pub fn delete_device(db: &Db, device_id: &str) -> Result<()> {
-    let conn = db.lock().unwrap();
-    conn.execute("DELETE FROM devices WHERE id = ?1", params![device_id])?;
+pub async fn delete_device(db: &Db, device_id: &str) -> Result<()> {
+    sqlx::query(&db.adapt("DELETE FROM devices WHERE id = ?"))
+        .bind(device_id)
+        .execute(&db.pool)
+        .await?;
     Ok(())
 }
 
 /// Looks up the device owning `token`, returning `(device_id, version)`.
-/// `version` becomes the ETag for `GET /api/sync` - see
-/// `routes::device_sync`.
-pub fn find_device_by_token(db: &Db, token: &str) -> Result<Option<(String, i64)>> {
-    let conn = db.lock().unwrap();
-    conn.query_row(
-        "SELECT id, version FROM devices WHERE token = ?1",
-        params![token],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )
-    .map(Some)
-    .or_else(|e| match e {
-        rusqlite::Error::QueryReturnedNoRows => Ok(None),
-        e => Err(e.into()),
-    })
+pub async fn find_device_by_token(db: &Db, token: &str) -> Result<Option<(String, i64)>> {
+    let row = sqlx::query(&db.adapt("SELECT id, version FROM devices WHERE token = ?"))
+        .bind(token)
+        .fetch_optional(&db.pool)
+        .await?;
+    row.map(|r| -> Result<(String, i64)> { Ok((r.try_get(0)?, r.try_get(1)?)) })
+        .transpose()
 }
 
-// --- Console accounts & sessions ---------------------------------------
-
-pub fn register_account(db: &Db, username: &str, password_hash: &str) -> Result<Account> {
-    let conn = db.lock().unwrap();
-    conn.execute(
-        "INSERT INTO accounts (username, password_hash, created_at) VALUES (?1, ?2, ?3)",
-        params![username, password_hash, now_unix()],
-    )?;
-    let id = conn.last_insert_rowid();
-    Ok(Account {
-        id,
-        username: username.to_string(),
-        created_at: now_unix(),
-    })
-}
-
-/// Returns `(account_id, password_hash)` for a username, if it exists.
-pub fn find_account_by_username(db: &Db, username: &str) -> Result<Option<(i64, String)>> {
-    let conn = db.lock().unwrap();
-    conn.query_row(
-        "SELECT id, password_hash FROM accounts WHERE username = ?1",
-        params![username],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )
-    .map(Some)
-    .or_else(|e| match e {
-        rusqlite::Error::QueryReturnedNoRows => Ok(None),
-        e => Err(e.into()),
-    })
-}
-
-pub fn account_by_id(db: &Db, account_id: i64) -> Result<Option<Account>> {
-    let conn = db.lock().unwrap();
-    conn.query_row(
-        "SELECT id, username, created_at FROM accounts WHERE id = ?1",
-        params![account_id],
-        |row| {
-            Ok(Account {
-                id: row.get(0)?,
-                username: row.get(1)?,
-                created_at: row.get(2)?,
-            })
-        },
-    )
-    .map(Some)
-    .or_else(|e| match e {
-        rusqlite::Error::QueryReturnedNoRows => Ok(None),
-        e => Err(e.into()),
-    })
-}
-
-pub fn update_account_password(db: &Db, account_id: i64, password_hash: &str) -> Result<()> {
-    let conn = db.lock().unwrap();
-    conn.execute(
-        "UPDATE accounts SET password_hash = ?2 WHERE id = ?1",
-        params![account_id, password_hash],
-    )?;
-    Ok(())
-}
-
-/// Admin-only listing of every account with its device/session counts
-/// (no password hash - see `AccountSummary`).
-pub fn list_accounts(db: &Db) -> Result<Vec<AccountSummary>> {
-    let conn = db.lock().unwrap();
-    let mut stmt = conn.prepare(
-        "SELECT a.id, a.username, a.created_at,
-                (SELECT COUNT(*) FROM devices d WHERE d.account_id = a.id),
-                (SELECT COUNT(*) FROM sessions s WHERE s.account_id = a.id)
-         FROM accounts a ORDER BY a.username",
-    )?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok(AccountSummary {
-                id: row.get(0)?,
-                username: row.get(1)?,
-                created_at: row.get(2)?,
-                device_count: row.get(3)?,
-                session_count: row.get(4)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
-}
-
-/// Deletes an account; `false` when no such account exists. Devices and
-/// sessions cascade via `ON DELETE CASCADE`.
-pub fn delete_account(db: &Db, account_id: i64) -> Result<bool> {
-    let conn = db.lock().unwrap();
-    let deleted = conn.execute("DELETE FROM accounts WHERE id = ?1", params![account_id])?;
-    Ok(deleted > 0)
-}
-
-/// Creates a session for `account_id` and returns its bearer token.
-/// Sessions are persistent (stored in the DB) so the console stays logged
-/// in across server restarts; revoke by deleting the session.
-pub fn create_session(db: &Db, account_id: i64) -> Result<String> {
-    let conn = db.lock().unwrap();
-    let token = new_token();
-    conn.execute(
-        "INSERT INTO sessions (token, account_id, created_at) VALUES (?1, ?2, ?3)",
-        params![token, account_id, now_unix()],
-    )?;
-    Ok(token)
-}
-
-/// Maps a session token to its `account_id`, if valid.
-pub fn find_session(db: &Db, token: &str) -> Result<Option<i64>> {
-    let conn = db.lock().unwrap();
-    conn.query_row(
-        "SELECT account_id FROM sessions WHERE token = ?1",
-        params![token],
-        |row| row.get(0),
-    )
-    .map(Some)
-    .or_else(|e| match e {
-        rusqlite::Error::QueryReturnedNoRows => Ok(None),
-        e => Err(e.into()),
-    })
-}
-
-pub fn delete_session(db: &Db, token: &str) -> Result<()> {
-    let conn = db.lock().unwrap();
-    conn.execute("DELETE FROM sessions WHERE token = ?1", params![token])?;
-    Ok(())
-}
-
-fn bump_version(conn: &Connection, device_id: &str) -> Result<()> {
-    conn.execute(
-        "UPDATE devices SET version = version + 1 WHERE id = ?1",
-        params![device_id],
-    )?;
+async fn bump_version<'e, E>(db: &Db, executor: E, device_id: &str) -> Result<()>
+where
+    E: Executor<'e, Database = Any>,
+{
+    sqlx::query(&db.adapt("UPDATE devices SET version = version + 1 WHERE id = ?"))
+        .bind(device_id)
+        .execute(executor)
+        .await?;
     Ok(())
 }
 
 /// Applies only the fields the physical device is allowed to edit. Unknown
 /// IDs are ignored so stale device caches cannot recreate content deleted by
 /// Desktop/Server. Returns the resulting device version.
-pub fn merge_device_state(db: &Db, device_id: &str, state: &DeviceSyncRequest) -> Result<i64> {
-    let mut conn = db.lock().unwrap();
-    let tx = conn.transaction()?;
+pub async fn merge_device_state(
+    db: &Db,
+    device_id: &str,
+    state: &DeviceSyncRequest,
+) -> Result<i64> {
+    let mut tx = db.pool.begin().await?;
     let mut changed = false;
     for alarm in &state.alarms {
-        changed |= tx.execute(
-            "UPDATE alarms SET enabled = ?3 WHERE device_id = ?1 AND local_id = ?2 AND enabled != ?3",
-            params![device_id, alarm.id, alarm.enabled],
-        )? > 0;
+        let res = sqlx::query(&db.adapt(
+            "UPDATE alarms SET enabled = ? WHERE device_id = ? AND local_id = ? AND enabled != ?",
+        ))
+        .bind(alarm.enabled as i64)
+        .bind(device_id)
+        .bind(alarm.id as i64)
+        .bind(alarm.enabled as i64)
+        .execute(&mut *tx)
+        .await?;
+        changed |= res.rows_affected() > 0;
     }
     for todo in &state.todos {
-        changed |= tx.execute(
-            "UPDATE todos SET done = ?3 WHERE device_id = ?1 AND local_id = ?2 AND done != ?3",
-            params![device_id, todo.id, todo.done],
-        )? > 0;
+        let res =
+            sqlx::query(&db.adapt(
+                "UPDATE todos SET done = ? WHERE device_id = ? AND local_id = ? AND done != ?",
+            ))
+            .bind(todo.done as i64)
+            .bind(device_id)
+            .bind(todo.id as i64)
+            .bind(todo.done as i64)
+            .execute(&mut *tx)
+            .await?;
+        changed |= res.rows_affected() > 0;
         if let Some(importance) = todo.importance {
-            changed |= tx.execute(
-                "UPDATE todos SET importance = ?3 WHERE device_id = ?1 AND local_id = ?2 AND importance != ?3",
-                params![device_id, todo.id, importance.as_str()],
-            )? > 0;
+            let res = sqlx::query(&db.adapt("UPDATE todos SET importance = ? WHERE device_id = ? AND local_id = ? AND importance != ?"))
+            .bind(importance.as_str())
+            .bind(device_id)
+            .bind(todo.id as i64)
+            .bind(importance.as_str())
+            .execute(&mut *tx)
+            .await?;
+            changed |= res.rows_affected() > 0;
         }
     }
     if changed {
-        bump_version(&tx, device_id)?;
+        bump_version(db, &mut *tx, device_id).await?;
     }
-    let version = tx.query_row(
-        "SELECT version FROM devices WHERE id = ?1",
-        params![device_id],
-        |row| row.get(0),
-    )?;
-    tx.commit()?;
+    let version: i64 = sqlx::query_scalar(&db.adapt("SELECT version FROM devices WHERE id = ?"))
+        .bind(device_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    tx.commit().await?;
     Ok(version)
 }
 
-pub fn list_alarms(db: &Db, device_id: &str) -> Result<Vec<Alarm>> {
-    let conn = db.lock().unwrap();
-    let mut stmt = conn.prepare(
-        "SELECT local_id, hour, minute, repeat_kind, once_year, once_month, once_day, repeat_days, enabled, label
-         FROM alarms WHERE device_id = ?1 ORDER BY local_id",
-    )?;
-    let rows = stmt
-        .query_map(params![device_id], |row| {
-            let repeat_kind: String = row.get(3)?;
+pub async fn list_alarms(db: &Db, device_id: &str) -> Result<Vec<Alarm>> {
+    let rows = sqlx::query(&db.adapt("SELECT local_id, hour, minute, repeat_kind, once_year, once_month, once_day, repeat_days, enabled, label
+         FROM alarms WHERE device_id = ? ORDER BY local_id"))
+    .bind(device_id)
+    .fetch_all(&db.pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let repeat_kind: String = row.try_get(3)?;
             let repeat = repeat_from_columns(
                 &repeat_kind,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?,
-                row.get(7)?,
+                row.try_get(4)?,
+                row.try_get(5)?,
+                row.try_get(6)?,
+                row.try_get(7)?,
             );
             Ok(Alarm {
-                id: row.get(0)?,
-                hour: row.get(1)?,
-                minute: row.get(2)?,
+                id: u8::try_from(row.try_get::<i64, _>(0)?)
+                    .map_err(|_| anyhow!("alarm id out of range"))?,
+                hour: u8::try_from(row.try_get::<i64, _>(1)?)
+                    .map_err(|_| anyhow!("hour out of range"))?,
+                minute: u8::try_from(row.try_get::<i64, _>(2)?)
+                    .map_err(|_| anyhow!("minute out of range"))?,
                 repeat,
-                enabled: row.get::<_, i64>(8)? != 0,
-                label: row.get(9)?,
+                enabled: row.try_get::<i64, _>(8)? != 0,
+                label: row.try_get(9)?,
             })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+        })
+        .collect()
 }
 
-pub fn list_todos(db: &Db, device_id: &str) -> Result<Vec<Todo>> {
-    let conn = db.lock().unwrap();
-    let mut stmt = conn.prepare(
-        "SELECT local_id, text, done, importance, due_year, due_month, due_day, repeat_kind, repeat_days
-         FROM todos WHERE device_id = ?1 ORDER BY local_id",
-    )?;
-    let rows = stmt
-        .query_map(params![device_id], |row| {
-            let importance_str: String = row.get(3)?;
-            let due_year: Option<i64> = row.get(4)?;
-            let due_month: Option<i64> = row.get(5)?;
-            let due_day: Option<i64> = row.get(6)?;
-            let repeat_kind: Option<String> = row.get(7)?;
-            let repeat_days: Option<String> = row.get(8)?;
+pub async fn list_todos(db: &Db, device_id: &str) -> Result<Vec<Todo>> {
+    let rows = sqlx::query(&db.adapt("SELECT local_id, text, done, importance, due_year, due_month, due_day, repeat_kind, repeat_days
+         FROM todos WHERE device_id = ? ORDER BY local_id"))
+    .bind(device_id)
+    .fetch_all(&db.pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let importance_str: String = row.try_get(3)?;
+            let due_year: Option<i64> = row.try_get(4)?;
+            let due_month: Option<i64> = row.try_get(5)?;
+            let due_day: Option<i64> = row.try_get(6)?;
+            let repeat_kind: Option<String> = row.try_get(7)?;
+            let repeat_days: Option<String> = row.try_get(8)?;
             let due_date = match (due_year, due_month, due_day) {
                 (year, Some(month), Some(day)) => Some(crate::models::TodoDue {
                     year: year.unwrap_or(0) as u16,
@@ -554,24 +586,29 @@ pub fn list_todos(db: &Db, device_id: &str) -> Result<Vec<Todo>> {
                 _ => None,
             };
             Ok(Todo {
-                id: row.get(0)?,
-                text: row.get(1)?,
-                done: row.get::<_, i64>(2)? != 0,
+                id: u8::try_from(row.try_get::<i64, _>(0)?)
+                    .map_err(|_| anyhow!("todo id out of range"))?,
+                text: row.try_get(1)?,
+                done: row.try_get::<i64, _>(2)? != 0,
                 importance: importance_from_str(&importance_str),
                 due_date,
                 repeat,
             })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+        })
+        .collect()
 }
 
-fn next_local_id(conn: &Connection, table: &str, device_id: &str) -> Result<u8> {
-    let max: Option<i64> = conn.query_row(
-        &format!("SELECT MAX(local_id) FROM {table} WHERE device_id = ?1"),
-        params![device_id],
-        |row| row.get(0),
-    )?;
+async fn next_local_id<'e, E>(db: &Db, executor: E, table: &str, device_id: &str) -> Result<u8>
+where
+    E: Executor<'e, Database = Any>,
+{
+    let sql = db.adapt(&format!(
+        "SELECT MAX(local_id) FROM {table} WHERE device_id = ?"
+    ));
+    let max: Option<i64> = sqlx::query_scalar(&sql)
+        .bind(device_id)
+        .fetch_one(executor)
+        .await?;
     let next = max.map(|m| m + 1).unwrap_or(0);
     u8::try_from(next).map_err(|_| anyhow!("device has reached the 256-alarm/todo id limit"))
 }
@@ -579,65 +616,69 @@ fn next_local_id(conn: &Connection, table: &str, device_id: &str) -> Result<u8> 
 /// Creates a new alarm (`id: None`) or replaces an existing one (`id:
 /// Some`) for `device_id`, and returns the alarm's id. Bumps the device's
 /// sync version either way.
-pub fn upsert_alarm(
+pub async fn upsert_alarm(
     db: &Db,
     device_id: &str,
     id: Option<u8>,
     req: &UpsertAlarmRequest,
 ) -> Result<u8> {
-    let conn = db.lock().unwrap();
     let id = match id {
         Some(id) => id,
-        None => next_local_id(&conn, "alarms", device_id)?,
+        None => next_local_id(db, &db.pool, "alarms", device_id).await?,
     };
     let (repeat_kind, once_year, once_month, once_day, repeat_days) =
         repeat_to_columns(&req.repeat);
-    conn.execute(
-        "INSERT INTO alarms (device_id, local_id, hour, minute, repeat_kind, once_year, once_month, once_day, repeat_days, enabled, label)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+    sqlx::query(&db.adapt("INSERT INTO alarms (device_id, local_id, hour, minute, repeat_kind, once_year, once_month, once_day, repeat_days, enabled, label)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(device_id, local_id) DO UPDATE SET
             hour=excluded.hour, minute=excluded.minute, repeat_kind=excluded.repeat_kind,
             once_year=excluded.once_year, once_month=excluded.once_month, once_day=excluded.once_day,
             repeat_days=excluded.repeat_days,
-            enabled=excluded.enabled, label=excluded.label",
-        params![
-            device_id, id, req.hour, req.minute, repeat_kind, once_year, once_month, once_day,
-            repeat_days, req.enabled, req.label
-        ],
-    )?;
-    bump_version(&conn, device_id)?;
+            enabled=excluded.enabled, label=excluded.label"))
+    .bind(device_id)
+    .bind(id as i64)
+    .bind(req.hour as i64)
+    .bind(req.minute as i64)
+    .bind(repeat_kind)
+    .bind(once_year)
+    .bind(once_month)
+    .bind(once_day)
+    .bind(repeat_days)
+    .bind(req.enabled as i64)
+    .bind(&req.label)
+    .execute(&db.pool)
+    .await?;
+    bump_version(db, &db.pool, device_id).await?;
     Ok(id)
 }
 
-pub fn delete_alarm(db: &Db, device_id: &str, id: u8) -> Result<()> {
-    let conn = db.lock().unwrap();
-    conn.execute(
-        "DELETE FROM alarms WHERE device_id = ?1 AND local_id = ?2",
-        params![device_id, id],
-    )?;
-    bump_version(&conn, device_id)?;
+pub async fn delete_alarm(db: &Db, device_id: &str, id: u8) -> Result<()> {
+    sqlx::query(&db.adapt("DELETE FROM alarms WHERE device_id = ? AND local_id = ?"))
+        .bind(device_id)
+        .bind(id as i64)
+        .execute(&db.pool)
+        .await?;
+    bump_version(db, &db.pool, device_id).await?;
     Ok(())
 }
 
-pub fn clear_alarms(db: &Db, device_id: &str) -> Result<()> {
-    let conn = db.lock().unwrap();
-    conn.execute(
-        "DELETE FROM alarms WHERE device_id = ?1",
-        params![device_id],
-    )?;
-    bump_version(&conn, device_id)
+pub async fn clear_alarms(db: &Db, device_id: &str) -> Result<()> {
+    sqlx::query(&db.adapt("DELETE FROM alarms WHERE device_id = ?"))
+        .bind(device_id)
+        .execute(&db.pool)
+        .await?;
+    bump_version(db, &db.pool, device_id).await
 }
 
-pub fn upsert_todo(
+pub async fn upsert_todo(
     db: &Db,
     device_id: &str,
     id: Option<u8>,
     req: &UpsertTodoRequest,
 ) -> Result<u8> {
-    let conn = db.lock().unwrap();
     let id = match id {
         Some(id) => id,
-        None => next_local_id(&conn, "todos", device_id)?,
+        None => next_local_id(db, &db.pool, "todos", device_id).await?,
     };
     let (due_year, due_month, due_day) = match req.due_date {
         Some(due) => (
@@ -656,44 +697,44 @@ pub fn upsert_todo(
         Some(Repeat::Monthly { days }) => (Some("monthly"), repeat_days_json_opt(days)),
         Some(Repeat::Once { .. }) | None => (None, None),
     };
-    conn.execute(
-        "INSERT INTO todos (device_id, local_id, text, done, importance, due_year, due_month, due_day, repeat_kind, repeat_days)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+    sqlx::query(&db.adapt("INSERT INTO todos (device_id, local_id, text, done, importance, due_year, due_month, due_day, repeat_kind, repeat_days)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(device_id, local_id) DO UPDATE SET
             text=excluded.text, done=excluded.done, importance=excluded.importance,
             due_year=excluded.due_year, due_month=excluded.due_month, due_day=excluded.due_day,
-            repeat_kind=excluded.repeat_kind, repeat_days=excluded.repeat_days",
-        params![
-            device_id,
-            id,
-            req.text,
-            req.done,
-            req.importance.as_str(),
-            due_year,
-            due_month,
-            due_day,
-            repeat_kind,
-            repeat_days
-        ],
-    )?;
-    bump_version(&conn, device_id)?;
+            repeat_kind=excluded.repeat_kind, repeat_days=excluded.repeat_days"))
+    .bind(device_id)
+    .bind(id as i64)
+    .bind(&req.text)
+    .bind(req.done as i64)
+    .bind(req.importance.as_str())
+    .bind(due_year)
+    .bind(due_month)
+    .bind(due_day)
+    .bind(repeat_kind)
+    .bind(repeat_days)
+    .execute(&db.pool)
+    .await?;
+    bump_version(db, &db.pool, device_id).await?;
     Ok(id)
 }
 
-pub fn delete_todo(db: &Db, device_id: &str, id: u8) -> Result<()> {
-    let conn = db.lock().unwrap();
-    conn.execute(
-        "DELETE FROM todos WHERE device_id = ?1 AND local_id = ?2",
-        params![device_id, id],
-    )?;
-    bump_version(&conn, device_id)?;
+pub async fn delete_todo(db: &Db, device_id: &str, id: u8) -> Result<()> {
+    sqlx::query(&db.adapt("DELETE FROM todos WHERE device_id = ? AND local_id = ?"))
+        .bind(device_id)
+        .bind(id as i64)
+        .execute(&db.pool)
+        .await?;
+    bump_version(db, &db.pool, device_id).await?;
     Ok(())
 }
 
-pub fn clear_todos(db: &Db, device_id: &str) -> Result<()> {
-    let conn = db.lock().unwrap();
-    conn.execute("DELETE FROM todos WHERE device_id = ?1", params![device_id])?;
-    bump_version(&conn, device_id)
+pub async fn clear_todos(db: &Db, device_id: &str) -> Result<()> {
+    sqlx::query(&db.adapt("DELETE FROM todos WHERE device_id = ?"))
+        .bind(device_id)
+        .execute(&db.pool)
+        .await?;
+    bump_version(db, &db.pool, device_id).await
 }
 
 fn now_unix() -> i64 {
@@ -703,8 +744,125 @@ fn now_unix() -> i64 {
         .as_secs() as i64
 }
 
-/// Parses the SQLite `importance` column; unknown/legacy values fall back
-/// to `Medium`.
+// --- Console accounts & sessions ---------------------------------------
+
+pub async fn register_account(db: &Db, username: &str, password_hash: &str) -> Result<Account> {
+    let id: i64 = sqlx::query_scalar(&db.adapt(
+        "INSERT INTO accounts (username, password_hash, created_at) VALUES (?, ?, ?) RETURNING id",
+    ))
+    .bind(username)
+    .bind(password_hash)
+    .bind(now_unix())
+    .fetch_one(&db.pool)
+    .await?;
+    Ok(Account {
+        id,
+        username: username.to_string(),
+        created_at: now_unix(),
+    })
+}
+
+/// Returns `(account_id, password_hash)` for a username, if it exists.
+pub async fn find_account_by_username(db: &Db, username: &str) -> Result<Option<(i64, String)>> {
+    let row = sqlx::query(&db.adapt("SELECT id, password_hash FROM accounts WHERE username = ?"))
+        .bind(username)
+        .fetch_optional(&db.pool)
+        .await?;
+    row.map(|r| -> Result<(i64, String)> {
+        Ok((r.try_get::<i64, _>(0)?, r.try_get::<String, _>(1)?))
+    })
+    .transpose()
+}
+
+pub async fn account_by_id(db: &Db, account_id: i64) -> Result<Option<Account>> {
+    let row = sqlx::query(&db.adapt("SELECT id, username, created_at FROM accounts WHERE id = ?"))
+        .bind(account_id)
+        .fetch_optional(&db.pool)
+        .await?;
+    row.map(|r| -> Result<Account> {
+        Ok(Account {
+            id: r.try_get(0)?,
+            username: r.try_get(1)?,
+            created_at: r.try_get(2)?,
+        })
+    })
+    .transpose()
+}
+
+pub async fn update_account_password(db: &Db, account_id: i64, password_hash: &str) -> Result<()> {
+    sqlx::query(&db.adapt("UPDATE accounts SET password_hash = ? WHERE id = ?"))
+        .bind(password_hash)
+        .bind(account_id)
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
+/// Admin-only listing of every account with its device/session counts.
+pub async fn list_accounts(db: &Db) -> Result<Vec<AccountSummary>> {
+    let rows = sqlx::query(&db.adapt(
+        "SELECT a.id, a.username, a.created_at,
+                (SELECT COUNT(*) FROM devices d WHERE d.account_id = a.id),
+                (SELECT COUNT(*) FROM sessions s WHERE s.account_id = a.id)
+         FROM accounts a ORDER BY a.username",
+    ))
+    .fetch_all(&db.pool)
+    .await?;
+    rows.into_iter()
+        .map(|r| {
+            Ok(AccountSummary {
+                id: r.try_get(0)?,
+                username: r.try_get(1)?,
+                created_at: r.try_get(2)?,
+                device_count: r.try_get(3)?,
+                session_count: r.try_get(4)?,
+            })
+        })
+        .collect()
+}
+
+/// Deletes an account; `false` when no such account exists.
+pub async fn delete_account(db: &Db, account_id: i64) -> Result<bool> {
+    let res = sqlx::query(&db.adapt("DELETE FROM accounts WHERE id = ?"))
+        .bind(account_id)
+        .execute(&db.pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Creates a session for `account_id` and returns its bearer token.
+pub async fn create_session(db: &Db, account_id: i64) -> Result<String> {
+    let token = new_token();
+    sqlx::query(&db.adapt("INSERT INTO sessions (token, account_id, created_at) VALUES (?, ?, ?)"))
+        .bind(&token)
+        .bind(account_id)
+        .bind(now_unix())
+        .execute(&db.pool)
+        .await?;
+    Ok(token)
+}
+
+/// Maps a session token to its `account_id`, if valid.
+pub async fn find_session(db: &Db, token: &str) -> Result<Option<i64>> {
+    let row = sqlx::query(&db.adapt("SELECT account_id FROM sessions WHERE token = ?"))
+        .bind(token)
+        .fetch_optional(&db.pool)
+        .await?;
+    Ok(row.map(|r| r.try_get(0)).transpose()?)
+}
+
+pub async fn delete_session(db: &Db, token: &str) -> Result<()> {
+    sqlx::query(&db.adapt("DELETE FROM sessions WHERE token = ?"))
+        .bind(token)
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
+// --- Column helpers (shared by both backends) -----------------------------
+
+/// Parses the `importance` column; unknown/legacy values fall back to
+/// `Medium`.
 fn importance_from_str(s: &str) -> Importance {
     match s {
         "low" => Importance::Low,
@@ -713,15 +871,10 @@ fn importance_from_str(s: &str) -> Importance {
     }
 }
 
-/// Serializes a `Weekly`/`Monthly` day list to the JSON `repeat_days`
-/// column (compact, spaces stripped).
 fn repeat_days_json_opt(days: &[u8]) -> Option<String> {
     serde_json::to_string(days).ok().map(|s| s.replace(' ', ""))
 }
 
-/// Flattens a `Repeat` into the column tuple (`repeat_kind`,
-/// `once_year`, `once_month`, `once_day`, `repeat_days`). `repeat_days`
-/// holds the JSON array of covered days for `Weekly`/`Monthly` schedules.
 fn repeat_to_columns(
     repeat: &Repeat,
 ) -> (
@@ -746,8 +899,6 @@ fn repeat_to_columns(
     }
 }
 
-/// Rebuilds a `Repeat` from the flattened columns; unknown/legacy values
-/// fall back to `Daily`.
 fn repeat_from_columns(
     repeat_kind: &str,
     once_year: Option<i64>,
@@ -774,9 +925,6 @@ fn repeat_from_columns(
     }
 }
 
-/// Parses the `repeat_days` JSON column into a `Vec<u8>`; empty/malformed
-/// values become an empty vec (harmless - such a schedule simply never
-/// fires and the UI should not produce it).
 fn repeat_days_json(raw: Option<&str>) -> Vec<u8> {
     raw.and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_default()
@@ -786,10 +934,14 @@ fn repeat_days_json(raw: Option<&str>) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn bulk_clear_preserves_device_and_other_content() {
-        let db = open(":memory:").unwrap();
-        let device = register_device(&db, "test", None).unwrap();
+    async fn memory_db() -> Db {
+        open("sqlite::memory:", 1).await.expect("open in-memory db")
+    }
+
+    #[tokio::test]
+    async fn bulk_clear_preserves_device_and_other_content() {
+        let db = memory_db().await;
+        let device = register_device(&db, "test", None).await.unwrap();
         upsert_alarm(
             &db,
             device.id.as_str(),
@@ -802,6 +954,7 @@ mod tests {
                 label: "wake".to_string(),
             },
         )
+        .await
         .unwrap();
         upsert_todo(
             &db,
@@ -819,11 +972,15 @@ mod tests {
                 repeat: None,
             },
         )
+        .await
         .unwrap();
 
-        clear_alarms(&db, device.id.as_str()).unwrap();
-        assert!(list_alarms(&db, device.id.as_str()).unwrap().is_empty());
-        let todos = list_todos(&db, device.id.as_str()).unwrap();
+        clear_alarms(&db, device.id.as_str()).await.unwrap();
+        assert!(list_alarms(&db, device.id.as_str())
+            .await
+            .unwrap()
+            .is_empty());
+        let todos = list_todos(&db, device.id.as_str()).await.unwrap();
         assert_eq!(todos.len(), 1);
         assert_eq!(todos[0].importance, Importance::High);
         assert_eq!(
@@ -834,13 +991,13 @@ mod tests {
                 day: 25
             })
         );
-        assert_eq!(list_devices(&db).unwrap().len(), 1);
+        assert_eq!(list_devices(&db).await.unwrap().len(), 1);
     }
 
-    #[test]
-    fn device_merge_updates_flags_without_recreating_unknown_content() {
-        let db = open(":memory:").unwrap();
-        let device = register_device(&db, "test", None).unwrap();
+    #[tokio::test]
+    async fn device_merge_updates_flags_without_recreating_unknown_content() {
+        let db = memory_db().await;
+        let device = register_device(&db, "test", None).await.unwrap();
         let todo_id = upsert_todo(
             &db,
             device.id.as_str(),
@@ -853,8 +1010,10 @@ mod tests {
                 repeat: None,
             },
         )
+        .await
         .unwrap();
         let before = find_device_by_token(&db, device.token.as_deref().unwrap())
+            .await
             .unwrap()
             .unwrap()
             .1;
@@ -877,16 +1036,44 @@ mod tests {
                 ],
             },
         )
+        .await
         .unwrap();
-        let todos = list_todos(&db, device.id.as_str()).unwrap();
+        let todos = list_todos(&db, device.id.as_str()).await.unwrap();
         assert_eq!(todos.len(), 1);
         assert_eq!(todos[0].text, "server text");
         assert!(todos[0].done);
         assert_eq!(todos[0].importance, Importance::High);
         let after = find_device_by_token(&db, device.token.as_deref().unwrap())
+            .await
             .unwrap()
             .unwrap()
             .1;
         assert_eq!(after, before + 1);
+    }
+
+    #[tokio::test]
+    async fn account_flow_and_admin_summary() {
+        let db = memory_db().await;
+        let account = register_account(&db, "alice", "fake-hash").await.unwrap();
+        assert_eq!(account.id, 1);
+        let found = find_account_by_username(&db, "alice")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.0, account.id);
+
+        let device = register_device(&db, "alice-clock", Some(account.id))
+            .await
+            .unwrap();
+        assert!(device_owned_by(&db, &device.id, account.id).await.unwrap());
+        assert!(!device_owned_by(&db, &device.id, 999).await.unwrap());
+
+        let summaries = list_accounts(&db).await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].device_count, 1);
+
+        assert!(delete_account(&db, account.id).await.unwrap());
+        assert!(!delete_account(&db, account.id).await.unwrap());
+        assert!(list_devices(&db).await.unwrap().is_empty());
     }
 }

@@ -22,7 +22,16 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let db_path = std::env::var("DATABASE_PATH").unwrap_or_else(|_| "inkpaper.sqlite3".to_string());
+    // Database: a single `DATABASE_URL` selects the backend - `sqlite://…`
+    // (default, SQLite file) or `postgres://…`. Do not log the URL - a
+    // postgres URL may embed credentials.
+    let db_url =
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://inkpaper.sqlite3".to_string());
+    let db_kind = if db_url.starts_with("postgres://") {
+        "postgres"
+    } else {
+        "sqlite"
+    };
     let admin_token = std::env::var("ADMIN_TOKEN").context(
         "ADMIN_TOKEN env var is required - this is the bearer token inkpaper-desktop uses \
          for device registration and alarm/todo management; generate one long random string \
@@ -33,13 +42,13 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .context("BIND_ADDR must be a valid host:port")?;
 
-    let db = db::open(&db_path)?;
+    let db = db::open(&db_url, 2).await?;
     let state = routes::AppState { db, admin_token };
     let app = routes::router(state)
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive());
 
-    tracing::info!("inkpaper-server listening on {bind_addr}, db={db_path}");
+    tracing::info!("inkpaper-server listening on {bind_addr}, db={db_kind}");
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
