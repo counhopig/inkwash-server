@@ -39,6 +39,15 @@ export interface Device {
   token?: string;
 }
 
+/** Admin-only view of a console account (no password hash is exposed). */
+export interface AccountSummary {
+  id: number;
+  username: string;
+  created_at: number;
+  device_count: number;
+  session_count: number;
+}
+
 export interface UpsertAlarmInput {
   hour: number;
   minute: number;

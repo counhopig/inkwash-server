@@ -3,7 +3,7 @@
 // same-origin - no base URL to configure. Auth is a bearer token: either a
 // console-account session or the admin token.
 
-import type { Alarm, Device, Todo, UpsertAlarmInput, UpsertTodoInput } from "./types";
+import type { AccountSummary, Alarm, Device, Todo, UpsertAlarmInput, UpsertTodoInput } from "./types";
 
 export interface AuthResponse {
   token: string;
@@ -68,6 +68,23 @@ export function changePassword(token: string, oldPassword: string, newPassword: 
   return request<void>("/api/auth/password", token, {
     method: "POST",
     body: JSON.stringify({ old_password: oldPassword, new_password: newPassword }),
+  });
+}
+
+// --- Admin: account management (ADMIN_TOKEN only) --------------------------
+
+export function listAccounts(token: string) {
+  return request<AccountSummary[]>("/api/admin/accounts", token);
+}
+
+export function deleteAccount(token: string, accountId: number) {
+  return request<void>(`/api/admin/accounts/${accountId}`, token, { method: "DELETE" });
+}
+
+export function resetAccountPassword(token: string, accountId: number, newPassword: string) {
+  return request<void>(`/api/admin/accounts/${accountId}/password`, token, {
+    method: "POST",
+    body: JSON.stringify({ new_password: newPassword }),
   });
 }
 

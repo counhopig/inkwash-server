@@ -57,6 +57,30 @@ function resolveConfirm(value: boolean) {
   confirmResolver = null;
 }
 
+// --- Prompt dialog -----------------------------------------------------------
+
+const promptText = ref("");
+const promptPlaceholder = ref("");
+const promptValue = ref("");
+const promptVisible = ref(false);
+let promptResolver: ((value: string | null) => void) | null = null;
+
+function promptDialog(message: string, placeholder = ""): Promise<string | null> {
+  promptText.value = message;
+  promptPlaceholder.value = placeholder;
+  promptValue.value = "";
+  promptVisible.value = true;
+  return new Promise((resolve) => {
+    promptResolver = resolve;
+  });
+}
+
+function resolvePrompt(value: string | null) {
+  promptVisible.value = false;
+  promptResolver?.(value);
+  promptResolver = null;
+}
+
 // --- Request plumbing ----------------------------------------------------------
 
 function authToken(): string {
@@ -179,6 +203,7 @@ provide<UI>(uiKey, {
   authToken,
   toast,
   confirmDialog,
+  promptDialog,
   run,
   isBusy,
   onUnauthorized,
@@ -250,6 +275,31 @@ onMounted(async () => {
       <div class="row" style="justify-content: flex-end">
         <button type="button" class="quiet" @click="resolveConfirm(false)">Cancel</button>
         <button type="button" class="danger" autofocus @click="resolveConfirm(true)">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <div
+    v-if="promptVisible"
+    class="modal-backdrop"
+    @click.self="resolvePrompt(null)"
+    @keydown.esc="resolvePrompt(null)"
+  >
+    <div class="modal" role="dialog" aria-modal="true" aria-label="Enter a value">
+      <p class="modal-text">{{ promptText }}</p>
+      <input
+        v-model="promptValue"
+        :placeholder="promptPlaceholder"
+        class="modal-input"
+        type="password"
+        autocomplete="new-password"
+        @keyup.enter="resolvePrompt(promptValue.trim() || null)"
+      />
+      <div class="row" style="justify-content: flex-end; margin-top: 16px">
+        <button type="button" class="quiet" @click="resolvePrompt(null)">Cancel</button>
+        <button type="button" class="primary" @click="resolvePrompt(promptValue.trim() || null)">
+          Confirm
+        </button>
       </div>
     </div>
   </div>

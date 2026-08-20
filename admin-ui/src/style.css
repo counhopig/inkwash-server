@@ -615,6 +615,34 @@ button.imp.high {
   font-weight: 800;
 }
 
+/* Admin user management */
+.user-list {
+  border-top: 1px solid var(--line);
+}
+
+.user-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 2px;
+  border-bottom: 1px dashed var(--line);
+  transition: background 0.1s ease, padding-left 0.1s ease;
+}
+
+.user-row:hover {
+  background: var(--soft);
+  padding-left: 8px;
+}
+
+.user-row .text {
+  flex: 1;
+  min-width: 0;
+}
+
+.modal-input {
+  margin-top: 4px;
+}
+
 /* --- Confirm modal --------------------------------------------------------- */
 
 .modal-backdrop {
