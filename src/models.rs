@@ -196,3 +196,18 @@ pub struct ChangePasswordRequest {
     pub old_password: String,
     pub new_password: String,
 }
+
+/// Admin-only view of an account (never exposes the password hash).
+#[derive(Clone, Debug, Serialize)]
+pub struct AccountSummary {
+    pub id: i64,
+    pub username: String,
+    pub created_at: i64,
+    pub device_count: i64,
+    pub session_count: i64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct AdminResetPasswordRequest {
+    pub new_password: String,
+}

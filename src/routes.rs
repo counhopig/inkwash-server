@@ -23,8 +23,8 @@ use rust_embed::RustEmbed;
 
 use crate::db::{self, Db};
 use crate::models::{
-    Account, AuthRequest, AuthResponse, ChangePasswordRequest, DeviceSyncRequest,
-    RegisterDeviceRequest, SyncResponse, UpsertAlarmRequest, UpsertTodoRequest,
+    Account, AdminResetPasswordRequest, AuthRequest, AuthResponse, ChangePasswordRequest,
+    DeviceSyncRequest, RegisterDeviceRequest, SyncResponse, UpsertAlarmRequest, UpsertTodoRequest,
 };
 
 /// The built admin console (`admin-ui/`, a small Vue 3 + Vite app - see
@@ -52,6 +52,15 @@ pub fn router(state: AppState) -> Router {
         .route("/api/auth/logout", post(logout_account))
         .route("/api/auth/me", get(me))
         .route("/api/auth/password", post(change_password))
+        .route("/api/admin/accounts", get(admin_list_accounts))
+        .route(
+            "/api/admin/accounts/:account_id",
+            delete(admin_delete_account),
+        )
+        .route(
+            "/api/admin/accounts/:account_id/password",
+            post(admin_reset_password),
+        )
         .route("/api/sync", get(device_sync).post(device_push_sync))
         .route("/api/devices", post(register_device).get(list_devices))
         .route("/api/devices/:device_id", delete(delete_device))
@@ -341,6 +350,68 @@ fn require_device_access(
 fn internal_error(err: anyhow::Error) -> Response {
     tracing::error!("{err:#}");
     (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
+}
+
+// --- Admin: account management ---------------------------------------------
+
+/// The `ADMIN_TOKEN` is the owner credential; account sessions are not
+/// allowed past this gate.
+fn require_admin_only(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<(), (StatusCode, &'static str)> {
+    match auth_context(headers, state) {
+        Ok(AuthContext::Admin) => Ok(()),
+        Ok(AuthContext::Account(_)) => Err((StatusCode::FORBIDDEN, "admin token required")),
+        Err(resp) => Err(resp),
+    }
+}
+
+async fn admin_list_accounts(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = require_admin_only(&headers, &state) {
+        return resp.into_response();
+    }
+    match db::list_accounts(&state.db) {
+        Ok(accounts) => Json(accounts).into_response(),
+        Err(err) => internal_error(err),
+    }
+}
+
+async fn admin_delete_account(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<i64>,
+) -> Response {
+    if let Err(resp) = require_admin_only(&headers, &state) {
+        return resp.into_response();
+    }
+    match db::delete_account(&state.db, account_id) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "account not found").into_response(),
+        Err(err) => internal_error(err),
+    }
+}
+
+async fn admin_reset_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<i64>,
+    Json(req): Json<AdminResetPasswordRequest>,
+) -> Response {
+    if let Err(resp) = require_admin_only(&headers, &state) {
+        return resp.into_response();
+    }
+    if let Err(msg) = crate::auth::validate_password(&req.new_password) {
+        return bad_request(msg);
+    }
+    let hash = match crate::auth::hash_password(&req.new_password) {
+        Ok(h) => h,
+        Err(err) => return internal_error(err),
+    };
+    match db::update_account_password(&state.db, account_id, &hash) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => internal_error(err),
+    }
 }
 
 // --- Device-facing sync endpoint (docs/sync-api.md) -------------------

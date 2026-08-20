@@ -14,8 +14,8 @@ use rusqlite::{params, Connection};
 use uuid::Uuid;
 
 use crate::models::{
-    Account, Alarm, Device, DeviceSyncRequest, Importance, Repeat, Todo, UpsertAlarmRequest,
-    UpsertTodoRequest,
+    Account, AccountSummary, Alarm, Device, DeviceSyncRequest, Importance, Repeat, Todo,
+    UpsertAlarmRequest, UpsertTodoRequest,
 };
 
 pub type Db = Arc<Mutex<Connection>>;
@@ -383,6 +383,38 @@ pub fn update_account_password(db: &Db, account_id: i64, password_hash: &str) ->
         params![account_id, password_hash],
     )?;
     Ok(())
+}
+
+/// Admin-only listing of every account with its device/session counts
+/// (no password hash - see `AccountSummary`).
+pub fn list_accounts(db: &Db) -> Result<Vec<AccountSummary>> {
+    let conn = db.lock().unwrap();
+    let mut stmt = conn.prepare(
+        "SELECT a.id, a.username, a.created_at,
+                (SELECT COUNT(*) FROM devices d WHERE d.account_id = a.id),
+                (SELECT COUNT(*) FROM sessions s WHERE s.account_id = a.id)
+         FROM accounts a ORDER BY a.username",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(AccountSummary {
+                id: row.get(0)?,
+                username: row.get(1)?,
+                created_at: row.get(2)?,
+                device_count: row.get(3)?,
+                session_count: row.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Deletes an account; `false` when no such account exists. Devices and
+/// sessions cascade via `ON DELETE CASCADE`.
+pub fn delete_account(db: &Db, account_id: i64) -> Result<bool> {
+    let conn = db.lock().unwrap();
+    let deleted = conn.execute("DELETE FROM accounts WHERE id = ?1", params![account_id])?;
+    Ok(deleted > 0)
 }
 
 /// Creates a session for `account_id` and returns its bearer token.
