@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Personal-scale device-cloud backend in Rust + axum: admin API (single `ADMIN_TOKEN`) plus a device-facing sync endpoint `/api/sync` (per-device tokens, ETag/304 caching). The Vue 3 console `admin-ui/` is embedded into the binary at compile time via rust-embed. One of three repos: firmware + protocol docs live in `../inkpaper`, the desktop tool in `../inkpaper-desktop`.
+Personal-scale device-cloud backend in Rust + axum: an admin API guarded by the single `ADMIN_TOKEN` **plus** console-account sessions (`POST /api/auth/*`, Argon2id passwords, per-account device ownership), and a device-facing sync endpoint `/api/sync` (per-device tokens, ETag/304 caching). The Vue 3 console `admin-ui/` is embedded into the binary at compile time via rust-embed. One of three repos: firmware + protocol docs live in `../inkpaper`, the desktop tool in `../inkpaper-desktop`.
 
 ## Critical gotchas
 
@@ -23,11 +23,15 @@ Personal-scale device-cloud backend in Rust + axum: admin API (single `ADMIN_TOK
 
 ## Architecture
 
-- Entry chain: `src/main.rs` -> `src/routes.rs` (axum router; handlers return a concrete `Response`, auth is manual via a `HeaderMap` parameter) -> `src/db.rs` (SQLite behind a single shared `Arc<Mutex<Connection>>` - deliberately no connection pool; don't switch to sqlx/deadpool) -> `src/models.rs` (wire types).
-- Two trust domains share one router: `/api/*` (except `/api/sync`) guarded by the single `ADMIN_TOKEN`; `/api/sync` authenticated per-device.
+- Entry chain: `src/main.rs` -> `src/routes.rs` (axum router; handlers return a concrete `Response`, auth is manual via a `HeaderMap` parameter) -> `src/db.rs` (SQLite behind a single shared `Arc<Mutex<Connection>>` - deliberately no connection pool; don't switch to sqlx/deadpool) -> `src/models.rs` (wire types). `src/auth.rs` has the Argon2id password hashing + username/password validation.
+- Three trust domains share one router:
+  - `ADMIN_TOKEN` (env, from `main.rs`) - full access to every device, including unowned ones. This is how `inkpaper-desktop` keeps working unchanged.
+  - Console-account sessions (`/api/auth/login` / `/api/auth/register` return a bearer session token stored in the `sessions` table) - scoped to that account's own devices (`devices.account_id`); touching another account's device returns 404. `auth_context()` in `routes.rs` resolves which domain a request is in; `require_device_access()` additionally checks ownership for account sessions.
+  - `/api/sync` is authenticated per-device by the token `register_device` issued.
 - Every alarm/todo mutation bumps `devices.version`; `GET /api/sync` returns ETag `"d{device_id}-v{version}"` and answers 304 on matching `If-None-Match` (device id is embedded so a stale cache from an old/re-registered device can't suppress the first payload).
 - `POST /api/sync`: the device may only upload `enabled` flags for alarms and `done` flags for todos; unknown ids are silently ignored (no recreating content deleted server-side).
 - Alarm/todo `local_id` is `u8` (0..255); new ids take MAX+1 and error at the limit (`next_local_id`).
+- Accounts/sessions live in `accounts` and `sessions` tables; `devices.account_id` is `NULL` for devices registered with the admin token (desktop tool) and set for console-registered devices.
 
 ## Wire contract (don't change casually)
 
@@ -36,7 +40,9 @@ Personal-scale device-cloud backend in Rust + axum: admin API (single `ADMIN_TOK
 
 ## admin-ui
 
-- Single-file Vue 3 (`src/App.vue`), no router/state library; `src/lib/api.ts` is a thin same-origin fetch wrapper using relative paths - there is no base-URL config.
+- Vue 3, no router/state library - views switch via a `view` ref in `App.vue` (`dashboard` | `device` | `account`). `App.vue` is the coordinator: it owns the session, device list + per-device stats, and global toast/confirm/busy plumbing, and provides them to child views through `lib/ui.ts` (an `InjectionKey`; views `inject(uiKey)` instead of prop-drilling).
+- View components: `LoginView.vue` (sign in / create account / admin-token fallback), `DashboardView.vue` (stat strip + device cards + register device), `DeviceView.vue` (alarms/todos editor for one device, loads its own content), `AccountView.vue` (session info, change password, sign out). `src/lib/api.ts` is a thin same-origin fetch wrapper using relative paths - there is no base-URL config. `src/lib/storage.ts` persists the session (`inkpaper.admin.session`) and the admin token.
+- Every mutation goes through `ui.run(name, fn)` (double-submit guard + shared 401/error handling; a 401 anywhere drops the session back to login); `loadContent`/`loadDevices` use a sequence guard so stale responses can't overwrite newer ones.
 - Dev loop: `npm run dev` (:5173, vite proxies `/api` and `/health` to :8080) alongside a separate `cargo run`; `src/lib/clipboard.ts` falls back to `execCommand('copy')` because the console is normally opened over plain LAN http (no secure context).
 
 ## Other
