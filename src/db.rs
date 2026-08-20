@@ -14,22 +14,23 @@ use rusqlite::{params, Connection};
 use uuid::Uuid;
 
 use crate::models::{
-    Alarm, Device, DeviceSyncRequest, Importance, Repeat, Todo, UpsertAlarmRequest,
+    Account, Alarm, Device, DeviceSyncRequest, Importance, Repeat, Todo, UpsertAlarmRequest,
     UpsertTodoRequest,
 };
 
 pub type Db = Arc<Mutex<Connection>>;
 
 const DEVICES_TABLE: &str = "
-    CREATE TABLE devices (
+    CREATE TABLE IF NOT EXISTS devices (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
         token TEXT NOT NULL UNIQUE,
         version INTEGER NOT NULL DEFAULT 0,
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL,
+        account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE
     )";
 const ALARMS_TABLE: &str = "
-    CREATE TABLE alarms (
+    CREATE TABLE IF NOT EXISTS alarms (
         device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
         local_id INTEGER NOT NULL,
         hour INTEGER NOT NULL,
@@ -44,7 +45,7 @@ const ALARMS_TABLE: &str = "
         PRIMARY KEY (device_id, local_id)
     )";
 const TODOS_TABLE: &str = "
-    CREATE TABLE todos (
+    CREATE TABLE IF NOT EXISTS todos (
         device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
         local_id INTEGER NOT NULL,
         text TEXT NOT NULL,
@@ -57,11 +58,26 @@ const TODOS_TABLE: &str = "
         repeat_days TEXT,
         PRIMARY KEY (device_id, local_id)
     )";
+const ACCOUNTS_TABLE: &str = "
+    CREATE TABLE IF NOT EXISTS accounts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    )";
+const SESSIONS_TABLE: &str = "
+    CREATE TABLE IF NOT EXISTS sessions (
+        token TEXT PRIMARY KEY,
+        account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        created_at INTEGER NOT NULL
+    )";
 
 pub fn open(path: &str) -> Result<Db> {
     let mut conn = Connection::open(path).with_context(|| format!("failed to open {path}"))?;
     conn.pragma_update(None, "foreign_keys", true)?;
-    conn.execute_batch(&format!("{DEVICES_TABLE}; {ALARMS_TABLE}; {TODOS_TABLE};"))?;
+    conn.execute_batch(&format!(
+        "{ACCOUNTS_TABLE}; {SESSIONS_TABLE}; {DEVICES_TABLE}; {ALARMS_TABLE}; {TODOS_TABLE};"
+    ))?;
     migrate_legacy_integer_ids(&mut conn)?;
     // Databases created before these columns existed are missing them;
     // `CREATE TABLE IF NOT EXISTS` never adds columns, so add them
@@ -74,6 +90,7 @@ pub fn open(path: &str) -> Result<Db> {
         "ALTER TABLE todos ADD COLUMN repeat_kind TEXT",
         "ALTER TABLE todos ADD COLUMN repeat_days TEXT",
         "ALTER TABLE alarms ADD COLUMN repeat_days TEXT",
+        "ALTER TABLE devices ADD COLUMN account_id INTEGER",
     ] {
         let _ = conn.execute(stmt, []);
     }
@@ -221,14 +238,16 @@ fn new_token() -> String {
 /// token is a bearer credential (see `docs/sync-api.md`'s Security
 /// section in the firmware repo) - only ever returned here, at creation
 /// time; `list_devices` omits it, so losing it means re-registering.
-pub fn register_device(db: &Db, name: &str) -> Result<Device> {
+/// `account_id: None` creates an unowned device (only reachable with the
+/// `ADMIN_TOKEN`); `Some` ties the device to a console account.
+pub fn register_device(db: &Db, name: &str, account_id: Option<i64>) -> Result<Device> {
     let conn = db.lock().unwrap();
     let token = new_token();
     let now = now_unix();
     let id = Uuid::new_v4().to_string();
     conn.execute(
-        "INSERT INTO devices (id, name, token, version, created_at) VALUES (?1, ?2, ?3, 0, ?4)",
-        params![id, name, token, now],
+        "INSERT INTO devices (id, name, token, version, created_at, account_id) VALUES (?1, ?2, ?3, 0, ?4, ?5)",
+        params![id, name, token, now, account_id],
     )?;
     Ok(Device {
         id,
@@ -252,6 +271,37 @@ pub fn list_devices(db: &Db) -> Result<Vec<Device>> {
     Ok(rows)
 }
 
+/// Devices owned by one console account (for `GET /api/devices` when the
+/// caller is an account session rather than the admin token).
+pub fn list_account_devices(db: &Db, account_id: i64) -> Result<Vec<Device>> {
+    let conn = db.lock().unwrap();
+    let mut stmt =
+        conn.prepare("SELECT id, name FROM devices WHERE account_id = ?1 ORDER BY name")?;
+    let rows = stmt
+        .query_map(params![account_id], |row| {
+            Ok(Device {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                token: None,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Whether `device_id` exists and is owned by `account_id`. Used to scope
+/// alarm/todo routes to an account's own devices.
+pub fn device_owned_by(db: &Db, device_id: &str, account_id: i64) -> Result<bool> {
+    let conn = db.lock().unwrap();
+    conn.query_row(
+        "SELECT COUNT(*) FROM devices WHERE id = ?1 AND account_id = ?2",
+        params![device_id, account_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|count| count > 0)
+    .map_err(Into::into)
+}
+
 pub fn delete_device(db: &Db, device_id: &str) -> Result<()> {
     let conn = db.lock().unwrap();
     conn.execute("DELETE FROM devices WHERE id = ?1", params![device_id])?;
@@ -273,6 +323,100 @@ pub fn find_device_by_token(db: &Db, token: &str) -> Result<Option<(String, i64)
         rusqlite::Error::QueryReturnedNoRows => Ok(None),
         e => Err(e.into()),
     })
+}
+
+// --- Console accounts & sessions ---------------------------------------
+
+pub fn register_account(db: &Db, username: &str, password_hash: &str) -> Result<Account> {
+    let conn = db.lock().unwrap();
+    conn.execute(
+        "INSERT INTO accounts (username, password_hash, created_at) VALUES (?1, ?2, ?3)",
+        params![username, password_hash, now_unix()],
+    )?;
+    let id = conn.last_insert_rowid();
+    Ok(Account {
+        id,
+        username: username.to_string(),
+        created_at: now_unix(),
+    })
+}
+
+/// Returns `(account_id, password_hash)` for a username, if it exists.
+pub fn find_account_by_username(db: &Db, username: &str) -> Result<Option<(i64, String)>> {
+    let conn = db.lock().unwrap();
+    conn.query_row(
+        "SELECT id, password_hash FROM accounts WHERE username = ?1",
+        params![username],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .map(Some)
+    .or_else(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+        e => Err(e.into()),
+    })
+}
+
+pub fn account_by_id(db: &Db, account_id: i64) -> Result<Option<Account>> {
+    let conn = db.lock().unwrap();
+    conn.query_row(
+        "SELECT id, username, created_at FROM accounts WHERE id = ?1",
+        params![account_id],
+        |row| {
+            Ok(Account {
+                id: row.get(0)?,
+                username: row.get(1)?,
+                created_at: row.get(2)?,
+            })
+        },
+    )
+    .map(Some)
+    .or_else(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+        e => Err(e.into()),
+    })
+}
+
+pub fn update_account_password(db: &Db, account_id: i64, password_hash: &str) -> Result<()> {
+    let conn = db.lock().unwrap();
+    conn.execute(
+        "UPDATE accounts SET password_hash = ?2 WHERE id = ?1",
+        params![account_id, password_hash],
+    )?;
+    Ok(())
+}
+
+/// Creates a session for `account_id` and returns its bearer token.
+/// Sessions are persistent (stored in the DB) so the console stays logged
+/// in across server restarts; revoke by deleting the session.
+pub fn create_session(db: &Db, account_id: i64) -> Result<String> {
+    let conn = db.lock().unwrap();
+    let token = new_token();
+    conn.execute(
+        "INSERT INTO sessions (token, account_id, created_at) VALUES (?1, ?2, ?3)",
+        params![token, account_id, now_unix()],
+    )?;
+    Ok(token)
+}
+
+/// Maps a session token to its `account_id`, if valid.
+pub fn find_session(db: &Db, token: &str) -> Result<Option<i64>> {
+    let conn = db.lock().unwrap();
+    conn.query_row(
+        "SELECT account_id FROM sessions WHERE token = ?1",
+        params![token],
+        |row| row.get(0),
+    )
+    .map(Some)
+    .or_else(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+        e => Err(e.into()),
+    })
+}
+
+pub fn delete_session(db: &Db, token: &str) -> Result<()> {
+    let conn = db.lock().unwrap();
+    conn.execute("DELETE FROM sessions WHERE token = ?1", params![token])?;
+    Ok(())
 }
 
 fn bump_version(conn: &Connection, device_id: &str) -> Result<()> {
@@ -613,7 +757,7 @@ mod tests {
     #[test]
     fn bulk_clear_preserves_device_and_other_content() {
         let db = open(":memory:").unwrap();
-        let device = register_device(&db, "test").unwrap();
+        let device = register_device(&db, "test", None).unwrap();
         upsert_alarm(
             &db,
             device.id.as_str(),
@@ -664,7 +808,7 @@ mod tests {
     #[test]
     fn device_merge_updates_flags_without_recreating_unknown_content() {
         let db = open(":memory:").unwrap();
-        let device = register_device(&db, "test").unwrap();
+        let device = register_device(&db, "test", None).unwrap();
         let todo_id = upsert_todo(
             &db,
             device.id.as_str(),

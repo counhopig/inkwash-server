@@ -165,3 +165,34 @@ pub struct UpsertTodoRequest {
     #[serde(default)]
     pub repeat: Option<Repeat>,
 }
+
+// --- Console accounts -----------------------------------------------------
+// These types are admin-console-only; they don't cross the sync wire
+// contract (the firmware never sees them).
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Account {
+    pub id: i64,
+    pub username: String,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct AuthRequest {
+    pub username: String,
+    pub password: String,
+}
+
+/// Session credential returned by register/login. The client sends it back
+/// as a bearer token, exactly like the `ADMIN_TOKEN`.
+#[derive(Clone, Debug, Serialize)]
+pub struct AuthResponse {
+    pub token: String,
+    pub username: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ChangePasswordRequest {
+    pub old_password: String,
+    pub new_password: String,
+}

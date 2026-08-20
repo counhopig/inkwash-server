@@ -1,12 +1,18 @@
-//! HTTP handlers. Two trust domains share this router:
+//! HTTP handlers. Three trust domains share this router:
 //! - `/api/*` (except `/api/sync`) is the admin/management surface used by
 //!   `inkpaper-desktop` to register devices and edit their alarms/todos.
-//!   Guarded by a single fixed `ADMIN_TOKEN` (see `main.rs`) - this is a
-//!   personal server for one owner, not a multi-tenant service, so a
-//!   single shared admin credential is enough.
+//!   Guarded by either the single fixed `ADMIN_TOKEN` (see `main.rs`) - a
+//!   personal server for one owner - or a console-account session.
+//! - `/api/auth/*` is the console account surface (register/login/logout/
+//!   change password). Account sessions are bearer tokens stored in the DB.
 //! - `/api/sync` is the device-facing endpoint from
 //!   `inkpaper/docs/sync-api.md`, guarded per-device by the token
 //!   `register_device` issued.
+//!
+//! Scope rules: a console account can only see/register/manage its own
+//! devices (`devices.account_id`); the `ADMIN_TOKEN` can see and manage
+//! everything, including unowned devices (the ones the desktop tool
+//! registers), so existing desktop workflows keep working unchanged.
 
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -17,7 +23,8 @@ use rust_embed::RustEmbed;
 
 use crate::db::{self, Db};
 use crate::models::{
-    DeviceSyncRequest, RegisterDeviceRequest, SyncResponse, UpsertAlarmRequest, UpsertTodoRequest,
+    Account, AuthRequest, AuthResponse, ChangePasswordRequest, DeviceSyncRequest,
+    RegisterDeviceRequest, SyncResponse, UpsertAlarmRequest, UpsertTodoRequest,
 };
 
 /// The built admin console (`admin-ui/`, a small Vue 3 + Vite app - see
@@ -40,6 +47,11 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(admin_index))
         .route("/assets/*path", get(admin_asset))
         .route("/health", get(health))
+        .route("/api/auth/register", post(register_account))
+        .route("/api/auth/login", post(login_account))
+        .route("/api/auth/logout", post(logout_account))
+        .route("/api/auth/me", get(me))
+        .route("/api/auth/password", post(change_password))
         .route("/api/sync", get(device_sync).post(device_push_sync))
         .route("/api/devices", post(register_device).get(list_devices))
         .route("/api/devices/:device_id", delete(delete_device))
@@ -86,6 +98,157 @@ async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
+// --- Console accounts ------------------------------------------------------
+
+async fn register_account(State(state): State<AppState>, Json(req): Json<AuthRequest>) -> Response {
+    let username = req.username.trim();
+    if let Err(msg) = crate::auth::validate_username(username) {
+        return bad_request(msg);
+    }
+    if let Err(msg) = crate::auth::validate_password(&req.password) {
+        return bad_request(msg);
+    }
+    if match db::find_account_by_username(&state.db, username) {
+        Ok(v) => v,
+        Err(err) => return internal_error(err),
+    }
+    .is_some()
+    {
+        return (StatusCode::CONFLICT, "username already taken").into_response();
+    }
+    let hash = match crate::auth::hash_password(&req.password) {
+        Ok(h) => h,
+        Err(err) => return internal_error(err),
+    };
+    let account = match db::register_account(&state.db, username, &hash) {
+        Ok(a) => a,
+        Err(err) => return internal_error(err),
+    };
+    issue_session(&state, account)
+}
+
+async fn login_account(State(state): State<AppState>, Json(req): Json<AuthRequest>) -> Response {
+    let username = req.username.trim();
+    let stored = match db::find_account_by_username(&state.db, username) {
+        Ok(v) => v,
+        Err(err) => return internal_error(err),
+    };
+    let account_id = match stored {
+        Some((id, hash)) => {
+            if !crate::auth::verify_password(&req.password, &hash) {
+                return (StatusCode::UNAUTHORIZED, "invalid username or password").into_response();
+            }
+            id
+        }
+        None => {
+            // Verify against a throwaway hash so unknown usernames cost a
+            // real Argon2 round too - no easy user enumeration by timing.
+            let _ = crate::auth::verify_password(
+                &req.password,
+                "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            );
+            return (StatusCode::UNAUTHORIZED, "invalid username or password").into_response();
+        }
+    };
+    let account = match db::account_by_id(&state.db, account_id) {
+        Ok(Some(a)) => a,
+        Ok(None) => {
+            return (StatusCode::UNAUTHORIZED, "invalid username or password").into_response()
+        }
+        Err(err) => return internal_error(err),
+    };
+    issue_session(&state, account)
+}
+
+fn issue_session(state: &AppState, account: Account) -> Response {
+    let token = match db::create_session(&state.db, account.id) {
+        Ok(t) => t,
+        Err(err) => return internal_error(err),
+    };
+    tracing::info!(account_id = account.id, username = %account.username, "console session issued");
+    (
+        StatusCode::OK,
+        Json(AuthResponse {
+            token,
+            username: account.username,
+        }),
+    )
+        .into_response()
+}
+
+async fn logout_account(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(token) = bearer_token(&headers) else {
+        return (StatusCode::NO_CONTENT).into_response();
+    };
+    match db::delete_session(&state.db, token) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => internal_error(err),
+    }
+}
+
+/// Validates a stored session token so the console can confirm it's still
+/// logged in on load. Also answers for the admin token.
+async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    match auth_context(&headers, &state) {
+        Ok(AuthContext::Admin) => Json(serde_json::json!({ "kind": "admin" })).into_response(),
+        Ok(AuthContext::Account(account_id)) => match db::account_by_id(&state.db, account_id) {
+            Ok(Some(account)) => Json(serde_json::json!({
+                "kind": "account",
+                "account_id": account.id,
+                "username": account.username
+            }))
+            .into_response(),
+            Ok(None) => (StatusCode::UNAUTHORIZED, "invalid session").into_response(),
+            Err(err) => internal_error(err),
+        },
+        Err(resp) => resp.into_response(),
+    }
+}
+
+async fn change_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ChangePasswordRequest>,
+) -> Response {
+    let ctx = match auth_context(&headers, &state) {
+        Ok(ctx) => ctx,
+        Err(resp) => return resp.into_response(),
+    };
+    let AuthContext::Account(account_id) = ctx else {
+        // The admin token is configured via env, not a password we can
+        // change - reject instead of pretending to succeed.
+        return (
+            StatusCode::BAD_REQUEST,
+            "admin token is set in server config",
+        )
+            .into_response();
+    };
+    let stored = match db::account_by_id(&state.db, account_id) {
+        Ok(Some(a)) => a,
+        Ok(None) => return (StatusCode::UNAUTHORIZED, "invalid session").into_response(),
+        Err(err) => return internal_error(err),
+    };
+    let (_, hash) = match db::find_account_by_username(&state.db, &stored.username) {
+        Ok(Some(v)) => v,
+        Ok(None) => return (StatusCode::UNAUTHORIZED, "invalid session").into_response(),
+        Err(err) => return internal_error(err),
+    };
+    if !crate::auth::verify_password(&req.old_password, &hash) {
+        return (StatusCode::UNAUTHORIZED, "current password is incorrect").into_response();
+    }
+    if let Err(msg) = crate::auth::validate_password(&req.new_password) {
+        return bad_request(msg);
+    }
+    let new_hash = match crate::auth::hash_password(&req.new_password) {
+        Ok(h) => h,
+        Err(err) => return internal_error(err),
+    };
+    match db::update_account_password(&state.db, account_id, &new_hash) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => internal_error(err),
+    }
+}
+
 fn bad_request(message: impl Into<String>) -> Response {
     (StatusCode::BAD_REQUEST, message.into()).into_response()
 }
@@ -122,10 +285,56 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .and_then(|v| v.strip_prefix("Bearer "))
 }
 
-fn require_admin(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCode, &'static str)> {
-    match bearer_token(headers) {
-        Some(token) if token == state.admin_token => Ok(()),
-        _ => Err((StatusCode::UNAUTHORIZED, "missing or invalid admin token")),
+/// Who is calling: the owner's `ADMIN_TOKEN` (full access), a console
+/// account session (`account_id`, scoped to that account's devices), or
+/// nobody (rejected with 401).
+#[derive(Clone, Copy)]
+enum AuthContext {
+    Admin,
+    Account(i64),
+}
+
+fn auth_context(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<AuthContext, (StatusCode, &'static str)> {
+    let Some(token) = bearer_token(headers) else {
+        return Err((StatusCode::UNAUTHORIZED, "missing or invalid credentials"));
+    };
+    if token == state.admin_token {
+        return Ok(AuthContext::Admin);
+    }
+    match db::find_session(&state.db, token) {
+        Ok(Some(account_id)) => Ok(AuthContext::Account(account_id)),
+        Ok(None) => Err((StatusCode::UNAUTHORIZED, "missing or invalid credentials")),
+        Err(err) => {
+            tracing::error!("{err:#}");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "storage error"))
+        }
+    }
+}
+
+/// Authenticates and, for account sessions, verifies the account owns
+/// `device_id`. The admin token may access any device. Returns the resolved
+/// context so the caller knows whether it is managing another account's
+/// device (relevant for `register_device`, which must attach ownership).
+fn require_device_access(
+    headers: &HeaderMap,
+    state: &AppState,
+    device_id: &str,
+) -> Result<AuthContext, Box<Response>> {
+    let ctx = auth_context(headers, state).map_err(|e| Box::new(e.into_response()))?;
+    match ctx {
+        AuthContext::Admin => Ok(ctx),
+        AuthContext::Account(account_id) => {
+            match db::device_owned_by(&state.db, device_id, account_id) {
+                Ok(true) => Ok(ctx),
+                Ok(false) => Err(Box::new(
+                    (StatusCode::NOT_FOUND, "device not found").into_response(),
+                )),
+                Err(err) => Err(Box::new(internal_error(err))),
+            }
+        }
     }
 }
 
@@ -229,23 +438,33 @@ async fn register_device(
     headers: HeaderMap,
     Json(req): Json<RegisterDeviceRequest>,
 ) -> Response {
-    if let Err(resp) = require_admin(&headers, &state) {
-        return resp.into_response();
-    }
+    let ctx = match auth_context(&headers, &state) {
+        Ok(ctx) => ctx,
+        Err(resp) => return resp.into_response(),
+    };
     if req.name.trim().is_empty() || req.name.chars().count() > 80 {
         return bad_request("device name must be 1..80 characters");
     }
-    match db::register_device(&state.db, &req.name) {
+    let account_id = match ctx {
+        AuthContext::Admin => None,
+        AuthContext::Account(id) => Some(id),
+    };
+    match db::register_device(&state.db, &req.name, account_id) {
         Ok(device) => (StatusCode::CREATED, Json(device)).into_response(),
         Err(err) => internal_error(err),
     }
 }
 
 async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(resp) = require_admin(&headers, &state) {
-        return resp.into_response();
-    }
-    match db::list_devices(&state.db) {
+    let ctx = match auth_context(&headers, &state) {
+        Ok(ctx) => ctx,
+        Err(resp) => return resp.into_response(),
+    };
+    let devices = match ctx {
+        AuthContext::Admin => db::list_devices(&state.db),
+        AuthContext::Account(account_id) => db::list_account_devices(&state.db, account_id),
+    };
+    match devices {
         Ok(devices) => Json(devices).into_response(),
         Err(err) => internal_error(err),
     }
@@ -256,8 +475,9 @@ async fn delete_device(
     headers: HeaderMap,
     Path(device_id): Path<String>,
 ) -> Response {
-    if let Err(resp) = require_admin(&headers, &state) {
-        return resp.into_response();
+    match require_device_access(&headers, &state, &device_id) {
+        Ok(_) => {}
+        Err(resp) => return *resp,
     }
     match db::delete_device(&state.db, &device_id) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -272,8 +492,8 @@ async fn list_alarms(
     headers: HeaderMap,
     Path(device_id): Path<String>,
 ) -> Response {
-    if let Err(resp) = require_admin(&headers, &state) {
-        return resp.into_response();
+    if let Err(resp) = require_device_access(&headers, &state, &device_id) {
+        return *resp;
     }
     match db::list_alarms(&state.db, &device_id) {
         Ok(alarms) => Json(alarms).into_response(),
@@ -287,8 +507,8 @@ async fn create_alarm(
     Path(device_id): Path<String>,
     Json(req): Json<UpsertAlarmRequest>,
 ) -> Response {
-    if let Err(resp) = require_admin(&headers, &state) {
-        return resp.into_response();
+    if let Err(resp) = require_device_access(&headers, &state, &device_id) {
+        return *resp;
     }
     if let Err(msg) = validate_alarm(&req) {
         return bad_request(msg);
@@ -305,8 +525,8 @@ async fn update_alarm(
     Path((device_id, alarm_id)): Path<(String, u8)>,
     Json(req): Json<UpsertAlarmRequest>,
 ) -> Response {
-    if let Err(resp) = require_admin(&headers, &state) {
-        return resp.into_response();
+    if let Err(resp) = require_device_access(&headers, &state, &device_id) {
+        return *resp;
     }
     if let Err(msg) = validate_alarm(&req) {
         return bad_request(msg);
@@ -322,8 +542,8 @@ async fn clear_alarms(
     headers: HeaderMap,
     Path(device_id): Path<String>,
 ) -> Response {
-    if let Err(resp) = require_admin(&headers, &state) {
-        return resp.into_response();
+    if let Err(resp) = require_device_access(&headers, &state, &device_id) {
+        return *resp;
     }
     match db::clear_alarms(&state.db, &device_id) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -336,8 +556,8 @@ async fn delete_alarm(
     headers: HeaderMap,
     Path((device_id, alarm_id)): Path<(String, u8)>,
 ) -> Response {
-    if let Err(resp) = require_admin(&headers, &state) {
-        return resp.into_response();
+    if let Err(resp) = require_device_access(&headers, &state, &device_id) {
+        return *resp;
     }
     match db::delete_alarm(&state.db, &device_id, alarm_id) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -352,8 +572,8 @@ async fn list_todos(
     headers: HeaderMap,
     Path(device_id): Path<String>,
 ) -> Response {
-    if let Err(resp) = require_admin(&headers, &state) {
-        return resp.into_response();
+    if let Err(resp) = require_device_access(&headers, &state, &device_id) {
+        return *resp;
     }
     match db::list_todos(&state.db, &device_id) {
         Ok(todos) => Json(todos).into_response(),
@@ -367,8 +587,8 @@ async fn create_todo(
     Path(device_id): Path<String>,
     Json(req): Json<UpsertTodoRequest>,
 ) -> Response {
-    if let Err(resp) = require_admin(&headers, &state) {
-        return resp.into_response();
+    if let Err(resp) = require_device_access(&headers, &state, &device_id) {
+        return *resp;
     }
     if let Err(msg) = validate_todo(&req) {
         return bad_request(msg);
@@ -385,8 +605,8 @@ async fn update_todo(
     Path((device_id, todo_id)): Path<(String, u8)>,
     Json(req): Json<UpsertTodoRequest>,
 ) -> Response {
-    if let Err(resp) = require_admin(&headers, &state) {
-        return resp.into_response();
+    if let Err(resp) = require_device_access(&headers, &state, &device_id) {
+        return *resp;
     }
     if let Err(msg) = validate_todo(&req) {
         return bad_request(msg);
@@ -402,8 +622,8 @@ async fn clear_todos(
     headers: HeaderMap,
     Path(device_id): Path<String>,
 ) -> Response {
-    if let Err(resp) = require_admin(&headers, &state) {
-        return resp.into_response();
+    if let Err(resp) = require_device_access(&headers, &state, &device_id) {
+        return *resp;
     }
     match db::clear_todos(&state.db, &device_id) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -416,8 +636,8 @@ async fn delete_todo(
     headers: HeaderMap,
     Path((device_id, todo_id)): Path<(String, u8)>,
 ) -> Response {
-    if let Err(resp) = require_admin(&headers, &state) {
-        return resp.into_response();
+    if let Err(resp) = require_device_access(&headers, &state, &device_id) {
+        return *resp;
     }
     match db::delete_todo(&state.db, &device_id, todo_id) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
