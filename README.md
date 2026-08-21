@@ -67,15 +67,26 @@ via the "server owner" link) and register devices.
 - `GET /api/sync` — device-facing (`Bearer <device_token>`), ETag/304
   conditional pull (legacy; kept for older firmware).
 - `POST /api/sync` — device-facing (`Bearer <device_token>`): uploads
-  `enabled`/`done`/importance flags, merges them (unknown IDs ignored),
-  returns the authoritative `{alarms, todos}` list. This is what current
-  firmware calls — contract in the firmware repo's
+  `enabled`/`done`/importance flags and `inbox_read` seqs, merges them
+  (unknown IDs ignored), returns the authoritative `{alarms, todos, inbox}`
+  list plus an `inbox_read_acked` echo and an `inbox_truncated` flag. This
+  is what current firmware calls — contract in the firmware repo's
   [`docs/sync-api.md`](https://github.com/counhopig/inkpaper-firmware/blob/main/docs/sync-api.md).
 - `POST/GET/DELETE /api/devices[/:id]` — admin. `Bearer <ADMIN_TOKEN>` sees
   every device; a console-account session sees only its own devices.
   Registration returns the device token exactly once.
 - `/api/devices/:id/alarms` and `/todos` (GET/POST/PUT/DELETE, plus a
   DELETE-to-clear on each collection) — same auth rules as devices.
+- `/api/devices/:id/channels` and `/channels/:channel_id` — manage external
+  channels (webhook) for a device: create (returns the one-time token),
+  list, update, delete, `POST .../rotate-token`.
+- `POST /api/channels/:channel_id/messages` — **webhook delivery**:
+  `Bearer <channel_token>` (a per-channel token, distinct from admin/device
+  tokens), payload `{kind, title, body, when?}` with size limits, an
+  optional `Idempotency-Key` header for dedup. Inserts an inbox item and
+  bumps the device's sync version.
+- `/api/devices/:id/inbox` — admin debug view: `GET` (paged), `DELETE :seq`
+  (single), `DELETE` (clear read messages).
 - `/api/auth/register|login|logout` — console accounts. Register/login
   return a session bearer token (stored client-side); logout revokes it.
 - `GET /api/auth/me` — validates a stored session token (or the admin
