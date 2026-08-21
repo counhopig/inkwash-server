@@ -1,12 +1,12 @@
 //! HTTP handlers. Three trust domains share this router:
 //! - `/api/*` (except `/api/sync`) is the admin/management surface used by
-//!   `inkpaper-desktop` to register devices and edit their alarms/todos.
+//!   `inkwash-desktop` to register devices and edit their alarms/todos.
 //!   Guarded by either the single fixed `ADMIN_TOKEN` (see `main.rs`) - a
 //!   personal server for one owner - or a console-account session.
 //! - `/api/auth/*` is the console account surface (register/login/logout/
 //!   change password). Account sessions are bearer tokens stored in the DB.
 //! - `/api/sync` is the device-facing endpoint from
-//!   `inkpaper/docs/sync-api.md`, guarded per-device by the token
+//!   `inkwash/docs/sync-api.md`, guarded per-device by the token
 //!   `register_device` issued.
 //!
 //! Scope rules: a console account can only see/register/manage its own
@@ -528,13 +528,13 @@ async fn device_push_sync(
         Err(err) => return internal_error(err),
     };
 
-    // Lightweight poll: the device asks with `X-Inkpaper-Poll: 1` to check
+    // Lightweight poll: the device asks with `X-Inkwash-Poll: 1` to check
     // for unread urgent (high-priority) messages without pulling the whole
     // sync payload. Returns immediately (no hold, no merge, no full body) so
     // the firmware can poll frequently for urgent messages on a short timer
     // without keeping a long connection open or blocking its main loop.
     let wants_poll = headers
-        .get("x-inkpaper-poll")
+        .get("x-inkwash-poll")
         .and_then(|v| v.to_str().ok())
         .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
         .unwrap_or(false);

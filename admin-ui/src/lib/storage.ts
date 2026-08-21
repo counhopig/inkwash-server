@@ -1,5 +1,5 @@
-const KEY_ADMIN_TOKEN = "inkpaper.admin.token";
-const KEY_SESSION = "inkpaper.admin.session";
+const KEY_ADMIN_TOKEN = "inkwash.admin.token";
+const KEY_SESSION = "inkwash.admin.session";
 
 export function loadAdminToken(): string {
   return localStorage.getItem(KEY_ADMIN_TOKEN) ?? "";

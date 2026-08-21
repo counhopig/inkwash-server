@@ -18,7 +18,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "inkpaper_server=info,tower_http=info".into()),
+                .unwrap_or_else(|_| "inkwash_server=info,tower_http=info".into()),
         )
         .init();
 
@@ -26,14 +26,14 @@ async fn main() -> anyhow::Result<()> {
     // (default, SQLite file) or `postgres://…`. Do not log the URL - a
     // postgres URL may embed credentials.
     let db_url =
-        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://inkpaper.sqlite3".to_string());
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://inkwash.sqlite3".to_string());
     let db_kind = if db_url.starts_with("postgres://") {
         "postgres"
     } else {
         "sqlite"
     };
     let admin_token = std::env::var("ADMIN_TOKEN").context(
-        "ADMIN_TOKEN env var is required - this is the bearer token inkpaper-desktop uses \
+        "ADMIN_TOKEN env var is required - this is the bearer token inkwash-desktop uses \
          for device registration and alarm/todo management; generate one long random string \
          and keep it secret, e.g. `openssl rand -hex 32`",
     )?;
@@ -48,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive());
 
-    tracing::info!("inkpaper-server listening on {bind_addr}, db={db_kind}");
+    tracing::info!("inkwash-server listening on {bind_addr}, db={db_kind}");
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     axum::serve(listener, app).await?;
     Ok(())

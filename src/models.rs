@@ -1,5 +1,5 @@
 //! Wire types shared with the firmware's sync response (see
-//! `inkpaper/docs/sync-api.md`). Field names/shapes here must match
+//! `inkwash/docs/sync-api.md`). Field names/shapes here must match
 //! `rust-firmware/src/alarms.rs`'s `StoredAlarm`/`Repeat` and
 //! `rust-firmware/src/todos.rs`'s `Todo` exactly, since the firmware
 //! deserializes this JSON directly into those types with no adapter layer.
@@ -150,7 +150,7 @@ pub struct InboxItem {
 }
 
 /// Body of a successful (HTTP 200) `GET /api/sync` response - see
-/// `inkpaper/docs/sync-api.md`.
+/// `inkwash/docs/sync-api.md`.
 #[derive(Clone, Debug, Serialize)]
 pub struct SyncResponse {
     pub alarms: Vec<Alarm>,

@@ -19,4 +19,4 @@ export interface UI {
   onUnauthorized(): void;
 }
 
-export const uiKey: InjectionKey<UI> = Symbol("inkpaper-ui");
+export const uiKey: InjectionKey<UI> = Symbol("inkwash-ui");

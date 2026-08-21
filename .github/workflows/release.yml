@@ -16,9 +16,9 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            artifact: inkpaper-server-linux-x86_64
+            artifact: inkwash-server-linux-x86_64
           - os: macos-latest
-            artifact: inkpaper-server-macos-x86_64
+            artifact: inkwash-server-macos-x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -42,7 +42,7 @@ jobs:
       - name: Package
         run: |
           mkdir -p dist
-          cp target/release/inkpaper-server "dist/${{ matrix.artifact }}"
+          cp target/release/inkwash-server "dist/${{ matrix.artifact }}"
           tar -C dist -czf "dist/${{ matrix.artifact }}.tar.gz" "${{ matrix.artifact }}"
 
       - name: Upload to GitHub Release

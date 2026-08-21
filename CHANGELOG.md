@@ -1,9 +1,17 @@
 # Changelog
 
-All notable changes to **inkpaper-server** are documented in this file.
+All notable changes to **inkwash-server** are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.4.0] - 2026-08-21
+
+### Changed
+- **Rebranded to Inkwash** - package/binary name, urgent-poll header
+  (`x-inkpaper-poll` -> `x-inkwash-poll`), admin console title, and the
+  default database file (`inkwash.sqlite3`; a fresh database is created
+  on next start - recreate channels/webhook tokens).
 
 ## [0.3.0] - 2026-08-21
 
@@ -16,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Device inbox** — `inbox` table, `inbox_read_acked` / `inbox_truncated`
   sync fields, admin inbox debug endpoints (`GET`/`DELETE`), and the
   `has_unread_high_inbox` query backing urgent delivery.
-- **Lightweight urgent poll** — `X-Inkpaper-Poll: 1` on `POST /api/sync`
+- **Lightweight urgent poll** — `X-Inkwash-Poll: 1` on `POST /api/sync`
   answers `{"urgent": bool}` immediately (no merge, no full payload), so
   the firmware can poll for high-priority messages on a short cron
   cadence without pulling everything.

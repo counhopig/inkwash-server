@@ -1,5 +1,5 @@
 // Thin fetch wrapper for the admin API (see ../../../src/routes.rs). This
-// page is served by inkpaper-server itself at "/", so every call is
+// page is served by inkwash-server itself at "/", so every call is
 // same-origin - no base URL to configure. Auth is a bearer token: either a
 // console-account session or the admin token.
 

@@ -234,7 +234,7 @@ onMounted(async () => {
     <header class="masthead">
       <div class="masthead-title">
         <div class="eyebrow">Device cloud · admin console</div>
-        <h1>Inkpaper Console</h1>
+        <h1>Inkwash Console</h1>
         <p>Manage device content and prepare the next sync.</p>
       </div>
       <div class="userbar">

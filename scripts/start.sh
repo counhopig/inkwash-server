@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start the inkpaper-server: handle first-run setup, then launch.
+# Start the inkwash-server: handle first-run setup, then launch.
 #
 #   1. Ensures .env exists in the project root. If ADMIN_TOKEN is missing,
 #      generates a fresh random one (required by the server).
@@ -58,5 +58,5 @@ if [[ ! -d "$ADMIN_UI_DIR/node_modules" ]]; then
   (cd "$ADMIN_UI_DIR" && npm install)
 fi
 
-echo "starting inkpaper-server (Ctrl+C to stop)..."
+echo "starting inkwash-server (Ctrl+C to stop)..."
 exec cargo run --release

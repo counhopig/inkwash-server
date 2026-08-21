@@ -76,7 +76,7 @@ function switchMode(next: "login" | "register") {
     <header class="masthead login-masthead">
       <div class="masthead-title">
         <div class="eyebrow">Device cloud · admin console</div>
-        <h1>Inkpaper Console</h1>
+        <h1>Inkwash Console</h1>
         <p>Sign in to manage device content and prepare the next sync.</p>
       </div>
     </header>

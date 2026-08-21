@@ -1,8 +1,8 @@
-# Inkpaper Server
+# Inkwash Server
 
 Personal-scale cloud backend for the **Zectrix Note 4** e-ink device —
 stores alarms and todos per device and serves them over the sync contract.
-One half of the [**Inkpaper**](https://github.com/counhopig/inkpaper-firmware)
+One half of the [**Inkwash**](https://github.com/counhopig/inkwash-firmware)
 ecosystem, alongside a PC tool and the device firmware.
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
@@ -20,9 +20,9 @@ the binary, so the server is a single deployable artifact.
 
 ```mermaid
 flowchart LR
-    D["Zectrix Note 4<br/>inkpaper-firmware"] -->|"POST /api/sync (done/enabled flags)"| S["inkpaper-server<br/>Rust + axum + SQLite"]
+    D["Zectrix Note 4<br/>inkwash-firmware"] -->|"POST /api/sync (done/enabled flags)"| S["inkwash-server<br/>Rust + axum + SQLite"]
     S -->|"JSON alarms + todos"| D
-    T["inkpaper-desktop"] -->|"HTTPS admin API (ADMIN_TOKEN)"| S
+    T["inkwash-desktop"] -->|"HTTPS admin API (ADMIN_TOKEN)"| S
     U["Browser"] -->|"login /api/auth/* (session or ADMIN_TOKEN)"| S
 ```
 
@@ -49,7 +49,7 @@ Env vars:
 | Var            | Default               | Purpose                                   |
 | -------------- | --------------------- | ----------------------------------------- |
 | `ADMIN_TOKEN`  | _(required)_          | Owner bearer token: full access to all devices & accounts |
-| `DATABASE_URL` | `sqlite://inkpaper.sqlite3` | Backend selector: `sqlite://…` or `postgres://user:pass@host:5432/db` |
+| `DATABASE_URL` | `sqlite://inkwash.sqlite3` | Backend selector: `sqlite://…` or `postgres://user:pass@host:5432/db` |
 | `BIND_ADDR`    | `0.0.0.0:8080`        | Listen address                            |
 
 `.env` is loaded from the working directory; existing process
@@ -70,13 +70,13 @@ via the "server owner" link) and register devices.
   locally-changed `enabled`/`done`/importance flags and `inbox_read` seqs,
   merges them (unknown IDs ignored), returns the authoritative
   `{alarms, todos, inbox}` list plus an `inbox_read_acked` echo and an
-  `inbox_truncated` flag. A request with `X-Inkpaper-Poll: 1` is a
+  `inbox_truncated` flag. A request with `X-Inkwash-Poll: 1` is a
   **lightweight urgent poll**: the server answers immediately with
   `{"urgent": true|false}` — no merge, no full payload — so the firmware
   can check for high-priority messages on a short cron cadence without
   pulling everything. This is what current firmware calls — contract in
   the firmware repo's
-  [`docs/sync-api.md`](https://github.com/counhopig/inkpaper-firmware/blob/main/docs/sync-api.md).
+  [`docs/sync-api.md`](https://github.com/counhopig/inkwash-firmware/blob/main/docs/sync-api.md).
 - `POST/GET/DELETE /api/devices[/:id]` — admin. `Bearer <ADMIN_TOKEN>` sees
   every device; a console-account session sees only its own devices.
   Registration returns the device token exactly once.
@@ -129,7 +129,7 @@ cargo test          # 2 unit tests (DB schema + device-state merge)
 cd admin-ui && npm run build   # vue-tsc type check + vite build
 ```
 
-Exercised end-to-end against the physical device via `inkpaper-desktop`.
+Exercised end-to-end against the physical device via `inkwash-desktop`.
 
 ## License
 
