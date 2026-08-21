@@ -63,3 +63,35 @@ export interface UpsertTodoInput {
   due_date: TodoDue | null;
   repeat: Repeat | null;
 }
+
+export type ChannelKind = "webhook" | "caldav_basic";
+
+export interface Channel {
+  id: string;
+  device_id: string;
+  kind: ChannelKind;
+  name: string;
+  enabled: boolean;
+  token_prefix: string;
+  last_sync_at: number | null;
+  last_sync_error: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface ChannelCreated {
+  channel: Channel;
+  token?: string;
+  delivery_url?: string;
+}
+
+export type InboxKind = "alert" | "event" | "info";
+
+export interface InboxItem {
+  id: number;
+  kind: InboxKind;
+  title: string;
+  body: string;
+  when: number | null;
+  read: boolean;
+}

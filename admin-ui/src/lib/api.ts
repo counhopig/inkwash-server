@@ -3,7 +3,17 @@
 // same-origin - no base URL to configure. Auth is a bearer token: either a
 // console-account session or the admin token.
 
-import type { AccountSummary, Alarm, Device, Todo, UpsertAlarmInput, UpsertTodoInput } from "./types";
+import type {
+  AccountSummary,
+  Alarm,
+  Channel,
+  ChannelCreated,
+  Device,
+  InboxItem,
+  Todo,
+  UpsertAlarmInput,
+  UpsertTodoInput,
+} from "./types";
 
 export interface AuthResponse {
   token: string;
@@ -153,4 +163,43 @@ export function deleteTodo(token: string, deviceId: string, todoId: number) {
 
 export function clearTodos(token: string, deviceId: string) {
   return request<void>(`/api/devices/${deviceId}/todos`, token, { method: "DELETE" });
+}
+
+// --- Channels & inbox ------------------------------------------------------
+
+export function listChannels(token: string, deviceId: string) {
+  return request<Channel[]>(`/api/devices/${deviceId}/channels`, token);
+}
+
+export function createChannel(token: string, deviceId: string, kind: string, name: string) {
+  return request<ChannelCreated>(`/api/devices/${deviceId}/channels`, token, {
+    method: "POST",
+    body: JSON.stringify({ kind, name }),
+  });
+}
+
+export function deleteChannel(token: string, deviceId: string, channelId: string) {
+  return request<void>(`/api/devices/${deviceId}/channels/${channelId}`, token, {
+    method: "DELETE",
+  });
+}
+
+export function rotateChannelToken(token: string, deviceId: string, channelId: string) {
+  return request<{ token: string; token_prefix: string }>(
+    `/api/devices/${deviceId}/channels/${channelId}/rotate-token`,
+    token,
+    { method: "POST" },
+  );
+}
+
+export function listInbox(token: string, deviceId: string) {
+  return request<InboxItem[]>(`/api/devices/${deviceId}/inbox`, token);
+}
+
+export function deleteInboxItem(token: string, deviceId: string, seq: number) {
+  return request<void>(`/api/devices/${deviceId}/inbox/${seq}`, token, { method: "DELETE" });
+}
+
+export function clearInbox(token: string, deviceId: string) {
+  return request<void>(`/api/devices/${deviceId}/inbox`, token, { method: "DELETE" });
 }

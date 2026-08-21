@@ -90,12 +90,59 @@ pub struct Todo {
     pub repeat: Option<Repeat>,
 }
 
+/// Inbox notification kind, serialized snake_case to match the firmware's
+/// `InboxKind` (`"alert"`/`"event"`/`"info"`).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxKind {
+    Alert,
+    Event,
+    Info,
+}
+
+impl From<&str> for InboxKind {
+    fn from(s: &str) -> Self {
+        match s {
+            "alert" => InboxKind::Alert,
+            "event" => InboxKind::Event,
+            _ => InboxKind::Info,
+        }
+    }
+}
+
+/// A single inbox notification as seen by the device over the sync wire.
+/// `id` is the device-visible stable `seq` (u64); the server's internal
+/// UUID id is never sent to the device.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InboxItem {
+    pub id: u64,
+    pub kind: InboxKind,
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub when: Option<i64>,
+    #[serde(default)]
+    pub read: bool,
+}
+
 /// Body of a successful (HTTP 200) `GET /api/sync` response - see
 /// `inkpaper/docs/sync-api.md`.
 #[derive(Clone, Debug, Serialize)]
 pub struct SyncResponse {
     pub alarms: Vec<Alarm>,
     pub todos: Vec<Todo>,
+    /// Inbox notifications delivered to the device (capacity-capped).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inbox: Vec<InboxItem>,
+    /// The device reported these `seq`s as read; echoed back so the
+    /// firmware can drop them from its pending-read set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inbox_read_acked: Vec<u64>,
+    /// True when the server had more inbox items than it could fit in the
+    /// response; the device shows a "more on server" hint.
+    #[serde(default)]
+    pub inbox_truncated: bool,
 }
 
 /// Mutable device-side state uploaded before the server returns its
@@ -108,6 +155,9 @@ pub struct DeviceSyncRequest {
     pub alarms: Vec<DeviceAlarmState>,
     #[serde(default)]
     pub todos: Vec<DeviceTodoState>,
+    /// Device-local inbox `seq`s the user has read; unknown ids are ignored.
+    #[serde(default)]
+    pub inbox_read: Vec<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -210,4 +260,72 @@ pub struct AccountSummary {
 #[derive(Clone, Debug, Deserialize)]
 pub struct AdminResetPasswordRequest {
     pub new_password: String,
+}
+
+// --- External channels & inbox ---------------------------------------------
+
+/// A configured external source (webhook / CalDAV) bound to one device.
+/// This is the admin-facing view; it never contains the plaintext token or
+/// decrypted CalDAV credentials.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Channel {
+    pub id: String,
+    pub device_id: String,
+    /// `"webhook"` or `"caldav_basic"` (Phase 1 implements webhook).
+    pub kind: String,
+    pub name: String,
+    pub enabled: bool,
+    /// Short prefix of the webhook token for human identification (never a
+    /// credential). Empty for non-webhook channels.
+    pub token_prefix: String,
+    pub last_sync_at: Option<i64>,
+    pub last_sync_error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct CreateChannelRequest {
+    pub kind: String,
+    pub name: String,
+    /// CalDAV-only: `{ url, username, password }` (encrypted server-side).
+    /// Reserved for Phase 2; webhook channels ignore it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub config: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct UpdateChannelRequest {
+    pub name: Option<String>,
+    pub enabled: Option<bool>,
+}
+
+/// Response to `POST .../channels` for a webhook channel: the plaintext
+/// token is returned exactly once here.
+#[derive(Clone, Debug, Serialize)]
+pub struct ChannelCreated {
+    pub channel: Channel,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_url: Option<String>,
+}
+
+/// Webhook delivery payload (`POST /api/channels/:id/messages`).
+#[derive(Clone, Debug, Deserialize)]
+pub struct InboxCreateRequest {
+    pub kind: String,
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub when: Option<i64>,
+}
+
+/// Response to a successful webhook delivery.
+#[derive(Clone, Debug, Serialize)]
+pub struct InboxAccepted {
+    pub accepted: bool,
+    pub id: u64,
 }

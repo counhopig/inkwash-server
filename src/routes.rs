@@ -24,7 +24,9 @@ use rust_embed::RustEmbed;
 use crate::db::{self, Db};
 use crate::models::{
     Account, AdminResetPasswordRequest, AuthRequest, AuthResponse, ChangePasswordRequest,
-    DeviceSyncRequest, RegisterDeviceRequest, SyncResponse, UpsertAlarmRequest, UpsertTodoRequest,
+    ChannelCreated, CreateChannelRequest, DeviceSyncRequest, InboxAccepted, InboxCreateRequest,
+    RegisterDeviceRequest, SyncResponse, UpdateChannelRequest, UpsertAlarmRequest,
+    UpsertTodoRequest,
 };
 
 /// The built admin console (`admin-ui/`, a small Vue 3 + Vite app - see
@@ -64,6 +66,27 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sync", get(device_sync).post(device_push_sync))
         .route("/api/devices", post(register_device).get(list_devices))
         .route("/api/devices/:device_id", delete(delete_device))
+        .route(
+            "/api/devices/:device_id/channels",
+            get(list_channels).post(create_channel),
+        )
+        .route(
+            "/api/devices/:device_id/channels/:channel_id",
+            get(get_channel).put(update_channel).delete(delete_channel),
+        )
+        .route(
+            "/api/devices/:device_id/channels/:channel_id/rotate-token",
+            post(rotate_channel_token),
+        )
+        .route("/api/channels/:channel_id/messages", post(deliver_inbox))
+        .route(
+            "/api/devices/:device_id/inbox",
+            get(list_inbox).delete(clear_inbox),
+        )
+        .route(
+            "/api/devices/:device_id/inbox/:seq",
+            delete(delete_inbox_item),
+        )
         .route(
             "/api/devices/:device_id/alarms",
             get(list_alarms).post(create_alarm).delete(clear_alarms),
@@ -420,6 +443,37 @@ async fn admin_reset_password(
 
 // --- Device-facing sync endpoint (docs/sync-api.md) -------------------
 
+/// Builds the sync payload (alarms/todos + capped inbox). Reuses the inbox
+/// read-merge so the `inbox_read` upload is folded into the response.
+async fn build_sync_response(
+    state: &AppState,
+    device_id: &str,
+    inbox_read: &[u64],
+) -> Result<SyncResponse, Response> {
+    let alarms = db::list_alarms(&state.db, device_id)
+        .await
+        .map_err(internal_error)?;
+    let todos = db::list_todos(&state.db, device_id)
+        .await
+        .map_err(internal_error)?;
+    let acked = db::mark_inbox_read(&state.db, device_id, inbox_read)
+        .await
+        .map_err(internal_error)?;
+    let (inbox, truncated) = db::list_inbox(&state.db, device_id, INBOX_LIMIT)
+        .await
+        .map_err(internal_error)?;
+    Ok(SyncResponse {
+        alarms,
+        todos,
+        inbox,
+        inbox_read_acked: acked,
+        inbox_truncated: truncated,
+    })
+}
+
+/// Max inbox items sent to the device in one sync response (hard capacity).
+const INBOX_LIMIT: usize = 20;
+
 async fn device_sync(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let Some(token) = bearer_token(&headers) else {
         tracing::warn!("sync rejected: missing bearer token");
@@ -445,21 +499,16 @@ async fn device_sync(State(state): State<AppState>, headers: HeaderMap) -> Respo
         return StatusCode::NOT_MODIFIED.into_response();
     }
 
-    let alarms = match db::list_alarms(&state.db, &device_id).await {
-        Ok(v) => v,
-        Err(err) => return internal_error(err),
+    let body = match build_sync_response(&state, &device_id, &[]).await {
+        Ok(body) => Json(body),
+        Err(resp) => return resp.into_response(),
     };
-    let todos = match db::list_todos(&state.db, &device_id).await {
-        Ok(v) => v,
-        Err(err) => return internal_error(err),
-    };
-
-    let body = Json(SyncResponse { alarms, todos });
     tracing::info!(
         device_id,
         version,
         alarm_count = body.0.alarms.len(),
         todo_count = body.0.todos.len(),
+        inbox_count = body.0.inbox.len(),
         "sync payload served"
     );
     (StatusCode::OK, [(axum::http::header::ETAG, etag)], body).into_response()
@@ -482,28 +531,20 @@ async fn device_push_sync(
         Ok(version) => version,
         Err(err) => return internal_error(err),
     };
-    let alarms = match db::list_alarms(&state.db, &device_id).await {
-        Ok(value) => value,
-        Err(err) => return internal_error(err),
-    };
-    let todos = match db::list_todos(&state.db, &device_id).await {
-        Ok(value) => value,
-        Err(err) => return internal_error(err),
+    let body = match build_sync_response(&state, &device_id, &req.inbox_read).await {
+        Ok(body) => Json(body),
+        Err(resp) => return resp.into_response(),
     };
     let etag = format!("\"d{device_id}-v{version}\"");
     tracing::info!(
         device_id,
         version,
-        alarm_count = alarms.len(),
-        todo_count = todos.len(),
+        alarm_count = body.0.alarms.len(),
+        todo_count = body.0.todos.len(),
+        inbox_count = body.0.inbox.len(),
         "device state merged and sync payload served"
     );
-    (
-        StatusCode::OK,
-        [(axum::http::header::ETAG, etag)],
-        Json(SyncResponse { alarms, todos }),
-    )
-        .into_response()
+    (StatusCode::OK, [(axum::http::header::ETAG, etag)], body).into_response()
 }
 
 // --- Admin: devices -----------------------------------------------------
@@ -715,6 +756,285 @@ async fn delete_todo(
         return *resp;
     }
     match db::delete_todo(&state.db, &device_id, todo_id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => internal_error(err),
+    }
+}
+
+// --- External channels & inbox --------------------------------------------
+
+fn validate_channel_request(req: &CreateChannelRequest) -> Result<(), &'static str> {
+    if req.name.trim().is_empty() || req.name.chars().count() > 80 {
+        return Err("channel name must be 1..80 characters");
+    }
+    match req.kind.as_str() {
+        "webhook" => Ok(()),
+        other => Err(match other {
+            "caldav_basic" => "caldav_basic is not yet implemented",
+            _ => "channel kind must be 'webhook'",
+        }),
+    }
+}
+
+/// Validates a webhook payload; rejects (rather than silently truncates)
+/// anything that violates the size limits.
+fn validate_inbox_payload(req: &InboxCreateRequest) -> Result<(), &'static str> {
+    if !matches!(req.kind.as_str(), "alert" | "event" | "info") {
+        return Err("kind must be one of 'alert' | 'event' | 'info'");
+    }
+    let title = req.title.trim();
+    if title.is_empty() {
+        return Err("title must not be empty");
+    }
+    if req.title.chars().count() > 120 || req.title.len() > 512 {
+        return Err("title too long (max 120 chars / 512 bytes)");
+    }
+    if req.body.chars().count() > 1000 || req.body.len() > 4096 {
+        return Err("body too long (max 1000 chars / 4 KiB)");
+    }
+    if let Some(when) = req.when {
+        if !(0..=4_102_444_800).contains(&when) {
+            return Err("when is outside a valid Unix epoch range");
+        }
+    }
+    Ok(())
+}
+
+async fn list_channels(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(device_id): Path<String>,
+) -> Response {
+    if let Err(resp) = require_device_access(&headers, &state, &device_id).await {
+        return *resp;
+    }
+    match db::list_channels(&state.db, &device_id).await {
+        Ok(channels) => Json(channels).into_response(),
+        Err(err) => internal_error(err),
+    }
+}
+
+async fn create_channel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(device_id): Path<String>,
+    Json(req): Json<CreateChannelRequest>,
+) -> Response {
+    if let Err(resp) = require_device_access(&headers, &state, &device_id).await {
+        return *resp;
+    }
+    if let Err(msg) = validate_channel_request(&req) {
+        return bad_request(msg);
+    }
+    // Phase 1 is webhook-only; no CalDAV config is accepted yet.
+    let config_encrypted = None;
+    match db::create_channel(
+        &state.db,
+        &device_id,
+        &req.kind,
+        &req.name,
+        config_encrypted,
+    )
+    .await
+    {
+        Ok((channel, token)) => {
+            let delivery_url = token
+                .as_ref()
+                .map(|_| format!("/api/channels/{}/messages", channel.id));
+            (
+                StatusCode::CREATED,
+                Json(ChannelCreated {
+                    channel,
+                    token,
+                    delivery_url,
+                }),
+            )
+                .into_response()
+        }
+        Err(err) => internal_error(err),
+    }
+}
+
+async fn get_channel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((device_id, channel_id)): Path<(String, String)>,
+) -> Response {
+    if let Err(resp) = require_device_access(&headers, &state, &device_id).await {
+        return *resp;
+    }
+    match db::get_channel(&state.db, &device_id, &channel_id).await {
+        Ok(Some(channel)) => Json(channel).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "channel not found").into_response(),
+        Err(err) => internal_error(err),
+    }
+}
+
+async fn update_channel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((device_id, channel_id)): Path<(String, String)>,
+    Json(req): Json<UpdateChannelRequest>,
+) -> Response {
+    if let Err(resp) = require_device_access(&headers, &state, &device_id).await {
+        return *resp;
+    }
+    let name = req.name.as_deref();
+    if let Some(name) = name {
+        if name.trim().is_empty() || name.chars().count() > 80 {
+            return bad_request("channel name must be 1..80 characters");
+        }
+    }
+    match db::update_channel(&state.db, &device_id, &channel_id, name, req.enabled).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "channel not found").into_response(),
+        Err(err) => internal_error(err),
+    }
+}
+
+async fn delete_channel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((device_id, channel_id)): Path<(String, String)>,
+) -> Response {
+    if let Err(resp) = require_device_access(&headers, &state, &device_id).await {
+        return *resp;
+    }
+    match db::delete_channel(&state.db, &device_id, &channel_id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "channel not found").into_response(),
+        Err(err) => internal_error(err),
+    }
+}
+
+async fn rotate_channel_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((device_id, channel_id)): Path<(String, String)>,
+) -> Response {
+    if let Err(resp) = require_device_access(&headers, &state, &device_id).await {
+        return *resp;
+    }
+    match db::rotate_channel_token(&state.db, &device_id, &channel_id).await {
+        Ok(Some(token)) => {
+            let prefix = token.chars().take(12).collect::<String>();
+            Json(serde_json::json!({ "token": token, "token_prefix": prefix })).into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, "channel not found or not a webhook").into_response(),
+        Err(err) => internal_error(err),
+    }
+}
+
+/// Webhook delivery endpoint: authenticates via the channel's own bearer
+/// token (distinct from admin/device tokens), validates the payload, and
+/// inserts an inbox item. `Idempotency-Key` maps to `source_ref`.
+async fn deliver_inbox(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(channel_id): Path<String>,
+    Json(req): Json<InboxCreateRequest>,
+) -> Response {
+    // Query the channel by id first, then verify the token. Both wrong-token
+    // and unknown-channel end as 401/404 so channel existence isn't leaked.
+    let Some((device_id, token_hash)) =
+        (match db::get_channel_for_delivery(&state.db, &channel_id).await {
+            Ok(v) => v,
+            Err(err) => return internal_error(err),
+        })
+    else {
+        return (StatusCode::NOT_FOUND, "unknown channel").into_response();
+    };
+    let Some(token) = bearer_token(&headers) else {
+        return (StatusCode::UNAUTHORIZED, "invalid channel token").into_response();
+    };
+    if !crate::auth::verify_password(token, &token_hash) {
+        return (StatusCode::UNAUTHORIZED, "invalid channel token").into_response();
+    }
+    // Only enabled channels accept deliveries.
+    let enabled = match db::get_channel(&state.db, &device_id, &channel_id).await {
+        Ok(Some(c)) => c.enabled,
+        _ => return (StatusCode::NOT_FOUND, "unknown channel").into_response(),
+    };
+    if !enabled {
+        return (StatusCode::FORBIDDEN, "channel disabled").into_response();
+    }
+    if let Err(msg) = validate_inbox_payload(&req) {
+        return bad_request(msg);
+    }
+    let source_ref = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    match db::deliver_inbox(
+        &state.db,
+        &device_id,
+        &channel_id,
+        req.kind.as_str(),
+        req.title.trim(),
+        req.body.trim(),
+        req.when,
+        source_ref.as_deref(),
+    )
+    .await
+    {
+        Ok((seq, created)) => {
+            let status = if created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            };
+            (
+                status,
+                Json(InboxAccepted {
+                    accepted: true,
+                    id: seq,
+                }),
+            )
+                .into_response()
+        }
+        Err(err) => internal_error(err),
+    }
+}
+
+async fn list_inbox(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(device_id): Path<String>,
+) -> Response {
+    if let Err(resp) = require_device_access(&headers, &state, &device_id).await {
+        return *resp;
+    }
+    match db::list_inbox(&state.db, &device_id, 200).await {
+        Ok((items, _truncated)) => Json(items).into_response(),
+        Err(err) => internal_error(err),
+    }
+}
+
+async fn delete_inbox_item(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((device_id, seq)): Path<(String, u64)>,
+) -> Response {
+    if let Err(resp) = require_device_access(&headers, &state, &device_id).await {
+        return *resp;
+    }
+    match db::delete_inbox_item(&state.db, &device_id, seq).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "inbox item not found").into_response(),
+        Err(err) => internal_error(err),
+    }
+}
+
+async fn clear_inbox(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(device_id): Path<String>,
+) -> Response {
+    if let Err(resp) = require_device_access(&headers, &state, &device_id).await {
+        return *resp;
+    }
+    match db::clear_read_inbox(&state.db, &device_id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => internal_error(err),
     }

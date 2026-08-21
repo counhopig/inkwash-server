@@ -17,8 +17,8 @@ use sqlx::{Any, AnyPool, Executor, Row};
 use uuid::Uuid;
 
 use crate::models::{
-    Account, AccountSummary, Alarm, Device, DeviceSyncRequest, Importance, Repeat, Todo,
-    UpsertAlarmRequest, UpsertTodoRequest,
+    Account, AccountSummary, Alarm, Channel, Device, DeviceSyncRequest, Importance, InboxItem,
+    InboxKind, Repeat, Todo, UpsertAlarmRequest, UpsertTodoRequest,
 };
 
 /// Wraps the sqlx `Any` pool plus the backend flag. Data SQL is written with
@@ -96,6 +96,47 @@ const SQLITE_TABLES: &str = "
         repeat_kind TEXT,
         repeat_days TEXT,
         PRIMARY KEY (device_id, local_id)
+    );
+    CREATE TABLE IF NOT EXISTS channels (
+        id TEXT PRIMARY KEY,
+        device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        name TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        token_hash TEXT,
+        token_prefix TEXT,
+        config_encrypted TEXT,
+        config_version INTEGER NOT NULL DEFAULT 1,
+        last_sync_at INTEGER,
+        last_sync_error TEXT,
+        sync_state TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_channels_device ON channels(device_id);
+    CREATE INDEX IF NOT EXISTS idx_channels_kind_enabled ON channels(kind, enabled);
+    CREATE TABLE IF NOT EXISTS inbox (
+        id TEXT PRIMARY KEY,
+        device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+        channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+        event_id TEXT,
+        seq INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        title TEXT NOT NULL,
+        body TEXT,
+        when_epoch INTEGER,
+        source_ref TEXT,
+        read INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        UNIQUE(device_id, seq),
+        UNIQUE(channel_id, source_ref)
+    );
+    CREATE INDEX IF NOT EXISTS idx_inbox_device_seq ON inbox(device_id, seq DESC);
+    CREATE INDEX IF NOT EXISTS idx_inbox_device_read ON inbox(device_id, read, seq DESC);
+    CREATE TABLE IF NOT EXISTS device_sequences (
+        device_id TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+        next_inbox_seq INTEGER NOT NULL
     );";
 
 const POSTGRES_TABLES: &str = "
@@ -144,6 +185,47 @@ const POSTGRES_TABLES: &str = "
         repeat_kind TEXT,
         repeat_days TEXT,
         PRIMARY KEY (device_id, local_id)
+    );
+    CREATE TABLE IF NOT EXISTS channels (
+        id TEXT PRIMARY KEY,
+        device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        name TEXT NOT NULL,
+        enabled BIGINT NOT NULL DEFAULT 1,
+        token_hash TEXT,
+        token_prefix TEXT,
+        config_encrypted TEXT,
+        config_version BIGINT NOT NULL DEFAULT 1,
+        last_sync_at BIGINT,
+        last_sync_error TEXT,
+        sync_state TEXT,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_channels_device ON channels(device_id);
+    CREATE INDEX IF NOT EXISTS idx_channels_kind_enabled ON channels(kind, enabled);
+    CREATE TABLE IF NOT EXISTS inbox (
+        id TEXT PRIMARY KEY,
+        device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+        channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+        event_id TEXT,
+        seq BIGINT NOT NULL,
+        kind TEXT NOT NULL,
+        title TEXT NOT NULL,
+        body TEXT,
+        when_epoch BIGINT,
+        source_ref TEXT,
+        read BIGINT NOT NULL DEFAULT 0,
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
+        UNIQUE(device_id, seq),
+        UNIQUE(channel_id, source_ref)
+    );
+    CREATE INDEX IF NOT EXISTS idx_inbox_device_seq ON inbox(device_id, seq DESC);
+    CREATE INDEX IF NOT EXISTS idx_inbox_device_read ON inbox(device_id, read, seq DESC);
+    CREATE TABLE IF NOT EXISTS device_sequences (
+        device_id TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+        next_inbox_seq BIGINT NOT NULL
     );";
 
 /// Opens (creating the schema if needed) the database at `url`, which may be
@@ -859,6 +941,408 @@ pub async fn delete_session(db: &Db, token: &str) -> Result<()> {
     Ok(())
 }
 
+// --- External channels & inbox ---------------------------------------------
+
+fn new_uuid() -> String {
+    Uuid::new_v4().to_string()
+}
+
+/// Generates a webhook bearer token: a 32+ byte CSPRNG string with an
+/// `ipwh_` prefix used to distinguish it from admin/device/session tokens.
+pub fn new_channel_token() -> String {
+    format!("ipwh_{}", new_token())
+}
+
+/// Creates a channel for `device_id` and returns `(Channel, plaintext_token)`.
+/// `token` is `Some` only for webhook channels and is returned exactly once.
+/// `config` (CalDAV etc.) is stored encrypted by the caller if provided.
+pub async fn create_channel(
+    db: &Db,
+    device_id: &str,
+    kind: &str,
+    name: &str,
+    config_encrypted: Option<&str>,
+) -> Result<(Channel, Option<String>)> {
+    let now = now_unix();
+    let id = new_uuid();
+    let (token_hash, token_prefix, token) = if kind == "webhook" {
+        let token = new_channel_token();
+        let hash = crate::auth::hash_password(&token)
+            .map_err(|e| anyhow!("failed to hash channel token: {e}"))?;
+        let prefix = token.chars().take(12).collect::<String>();
+        (Some(hash), Some(prefix), Some(token))
+    } else {
+        (None, None, None)
+    };
+    sqlx::query(&db.adapt(
+        "INSERT INTO channels (id, device_id, kind, name, enabled, token_hash, token_prefix, config_encrypted, config_version, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 1, ?, ?, ?, 1, ?, ?)",
+    ))
+    .bind(&id)
+    .bind(device_id)
+    .bind(kind)
+    .bind(name)
+    .bind(&token_hash)
+    .bind(&token_prefix)
+    .bind(config_encrypted)
+    .bind(now)
+    .bind(now)
+    .execute(&db.pool)
+    .await?;
+    bump_version(db, &db.pool, device_id).await?;
+    let channel = Channel {
+        id,
+        device_id: device_id.to_string(),
+        kind: kind.to_string(),
+        name: name.to_string(),
+        enabled: true,
+        token_prefix: token_prefix.unwrap_or_default(),
+        last_sync_at: None,
+        last_sync_error: None,
+        created_at: now,
+        updated_at: now,
+    };
+    Ok((channel, token))
+}
+
+fn channel_from_row(row: sqlx::any::AnyRow) -> Result<Channel> {
+    Ok(Channel {
+        id: row.try_get(0)?,
+        device_id: row.try_get(1)?,
+        kind: row.try_get(2)?,
+        name: row.try_get(3)?,
+        enabled: row.try_get::<i64, _>(4)? != 0,
+        token_prefix: row.try_get::<Option<String>, _>(5)?.unwrap_or_default(),
+        last_sync_at: row.try_get(6)?,
+        last_sync_error: row.try_get(7)?,
+        created_at: row.try_get(8)?,
+        updated_at: row.try_get(9)?,
+    })
+}
+
+pub async fn list_channels(db: &Db, device_id: &str) -> Result<Vec<Channel>> {
+    let rows = sqlx::query(&db.adapt(
+        "SELECT id, device_id, kind, name, enabled, token_prefix, last_sync_at, last_sync_error, created_at, updated_at
+         FROM channels WHERE device_id = ? ORDER BY created_at",
+    ))
+    .bind(device_id)
+    .fetch_all(&db.pool)
+    .await?;
+    rows.into_iter().map(channel_from_row).collect()
+}
+
+pub async fn get_channel(db: &Db, device_id: &str, channel_id: &str) -> Result<Option<Channel>> {
+    let row = sqlx::query(&db.adapt(
+        "SELECT id, device_id, kind, name, enabled, token_prefix, last_sync_at, last_sync_error, created_at, updated_at
+         FROM channels WHERE device_id = ? AND id = ?",
+    ))
+    .bind(device_id)
+    .bind(channel_id)
+    .fetch_optional(&db.pool)
+    .await?;
+    row.map(channel_from_row).transpose()
+}
+
+/// Finds a webhook channel by id without device scoping (delivery path) and
+/// returns it along with its stored token hash. Enforced `enabled` is checked
+/// by the caller after token verification so a wrong token and a disabled
+/// channel are indistinguishable.
+pub async fn get_channel_for_delivery(
+    db: &Db,
+    channel_id: &str,
+) -> Result<Option<(String, String)>> {
+    let row = sqlx::query(&db.adapt("SELECT device_id, token_hash FROM channels WHERE id = ?"))
+        .bind(channel_id)
+        .fetch_optional(&db.pool)
+        .await?;
+    row.map(|r| -> Result<(String, String)> {
+        let hash: String = r
+            .try_get::<Option<String>, _>(1)?
+            .ok_or_else(|| anyhow!("channel is not a webhook channel"))?;
+        Ok((r.try_get(0)?, hash))
+    })
+    .transpose()
+}
+
+pub async fn update_channel(
+    db: &Db,
+    device_id: &str,
+    channel_id: &str,
+    name: Option<&str>,
+    enabled: Option<bool>,
+) -> Result<bool> {
+    let res = sqlx::query(&db.adapt(
+        "UPDATE channels SET name = COALESCE(?, name), enabled = COALESCE(?, enabled), updated_at = ?
+         WHERE device_id = ? AND id = ?",
+    ))
+    .bind(name)
+    .bind(enabled.map(|b| b as i64))
+    .bind(now_unix())
+    .bind(device_id)
+    .bind(channel_id)
+    .execute(&db.pool)
+    .await?;
+    if res.rows_affected() > 0 {
+        bump_version(db, &db.pool, device_id).await?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+pub async fn delete_channel(db: &Db, device_id: &str, channel_id: &str) -> Result<bool> {
+    let res = sqlx::query(&db.adapt("DELETE FROM channels WHERE device_id = ? AND id = ?"))
+        .bind(device_id)
+        .bind(channel_id)
+        .execute(&db.pool)
+        .await?;
+    if res.rows_affected() > 0 {
+        bump_version(db, &db.pool, device_id).await?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Rotates a webhook channel's token, returning the new plaintext. Rejects
+/// non-webhook channels. The old token stops working immediately because it
+/// hashed to a different value than the stored one.
+pub async fn rotate_channel_token(
+    db: &Db,
+    device_id: &str,
+    channel_id: &str,
+) -> Result<Option<String>> {
+    let row = sqlx::query(&db.adapt("SELECT kind FROM channels WHERE device_id = ? AND id = ?"))
+        .bind(device_id)
+        .bind(channel_id)
+        .fetch_optional(&db.pool)
+        .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let kind: String = row.try_get(0)?;
+    if kind != "webhook" {
+        return Ok(None);
+    }
+    let token = new_channel_token();
+    let hash = crate::auth::hash_password(&token)
+        .map_err(|e| anyhow!("failed to hash channel token: {e}"))?;
+    let prefix = token.chars().take(12).collect::<String>();
+    sqlx::query(&db.adapt(
+        "UPDATE channels SET token_hash = ?, token_prefix = ?, updated_at = ? WHERE device_id = ? AND id = ?",
+    ))
+    .bind(&hash)
+    .bind(&prefix)
+    .bind(now_unix())
+    .bind(device_id)
+    .bind(channel_id)
+    .execute(&db.pool)
+    .await?;
+    Ok(Some(token))
+}
+
+/// Atomically allocates the next inbox `seq` for a device and writes the
+/// inbox row in the same transaction, so concurrent deliveries can never
+/// issue a duplicate `seq` for one device. Returns the allocated `seq`.
+#[allow(clippy::too_many_arguments)]
+async fn insert_inbox_with_seq(
+    db: &Db,
+    tx: &mut sqlx::Transaction<'_, Any>,
+    id: &str,
+    device_id: &str,
+    channel_id: &str,
+    kind: &str,
+    title: &str,
+    body: &str,
+    when: Option<i64>,
+    source_ref: Option<&str>,
+) -> Result<i64> {
+    // Ensure a sequence row exists, then claim the next value. The row is
+    // seeded at 0 and incremented before read, so the first allocated seq
+    // is 1.
+    sqlx::query(&db.adapt(
+        "INSERT INTO device_sequences (device_id, next_inbox_seq) VALUES (?, 0)
+         ON CONFLICT(device_id) DO NOTHING",
+    ))
+    .bind(device_id)
+    .execute(&mut **tx)
+    .await?;
+    let seq: i64 = if db.postgres {
+        let row = sqlx::query(&db.adapt(
+            "UPDATE device_sequences SET next_inbox_seq = next_inbox_seq + 1
+             WHERE device_id = ? RETURNING next_inbox_seq",
+        ))
+        .bind(device_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        row.try_get(0)?
+    } else {
+        let row = sqlx::query(&db.adapt(
+            "UPDATE device_sequences SET next_inbox_seq = next_inbox_seq + 1
+             WHERE device_id = ?",
+        ))
+        .bind(device_id)
+        .execute(&mut **tx)
+        .await?;
+        if row.rows_affected() == 0 {
+            return Err(anyhow!("failed to allocate inbox sequence"));
+        }
+        sqlx::query_scalar(
+            &db.adapt("SELECT next_inbox_seq FROM device_sequences WHERE device_id = ?"),
+        )
+        .bind(device_id)
+        .fetch_one(&mut **tx)
+        .await?
+    };
+    let now = now_unix();
+    sqlx::query(&db.adapt(
+        "INSERT INTO inbox (id, device_id, channel_id, seq, kind, title, body, when_epoch, source_ref, read, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+    ))
+    .bind(id)
+    .bind(device_id)
+    .bind(channel_id)
+    .bind(seq)
+    .bind(kind)
+    .bind(title)
+    .bind(body)
+    .bind(when)
+    .bind(source_ref)
+    .bind(now)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    Ok(seq)
+}
+
+/// Inserts a webhook-delivered inbox item, honoring idempotency via
+/// `source_ref`. Returns `(seq, created)` where `created` is false when the
+/// `source_ref` already exists (idempotent replay).
+#[allow(clippy::too_many_arguments)]
+pub async fn deliver_inbox(
+    db: &Db,
+    device_id: &str,
+    channel_id: &str,
+    kind: &str,
+    title: &str,
+    body: &str,
+    when: Option<i64>,
+    source_ref: Option<&str>,
+) -> Result<(u64, bool)> {
+    let mut tx = db.pool.begin().await?;
+    if let Some(ref_ref) = source_ref {
+        let existing: Option<i64> = sqlx::query_scalar(
+            &db.adapt("SELECT seq FROM inbox WHERE channel_id = ? AND source_ref = ?"),
+        )
+        .bind(channel_id)
+        .bind(ref_ref)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(seq) = existing {
+            tx.commit().await?;
+            return Ok((seq as u64, false));
+        }
+    }
+    let id = new_uuid();
+    let seq = insert_inbox_with_seq(
+        db, &mut tx, &id, device_id, channel_id, kind, title, body, when, source_ref,
+    )
+    .await?;
+    bump_version(db, &mut *tx, device_id).await?;
+    tx.commit().await?;
+    Ok((seq as u64, true))
+}
+
+/// Returns the device's inbox for the sync response: unread first, then by
+/// `seq DESC`, capped at `limit`. `truncated` is true when more rows exist.
+pub async fn list_inbox(db: &Db, device_id: &str, limit: usize) -> Result<(Vec<InboxItem>, bool)> {
+    let total: i64 =
+        sqlx::query_scalar(&db.adapt("SELECT COUNT(*) FROM inbox WHERE device_id = ?"))
+            .bind(device_id)
+            .fetch_one(&db.pool)
+            .await?;
+    let rows = sqlx::query(&db.adapt(
+        "SELECT seq, kind, title, body, when_epoch, read FROM inbox
+         WHERE device_id = ? ORDER BY read ASC, seq DESC LIMIT ?",
+    ))
+    .bind(device_id)
+    .bind(limit as i64)
+    .fetch_all(&db.pool)
+    .await?;
+    let items = rows
+        .into_iter()
+        .map(|r| {
+            Ok(InboxItem {
+                id: r.try_get::<i64, _>(0)? as u64,
+                kind: InboxKind::from(r.try_get::<String, _>(1)?.as_str()),
+                title: r.try_get(2)?,
+                body: r.try_get::<Option<String>, _>(3)?.unwrap_or_default(),
+                when: r.try_get(4)?,
+                read: r.try_get::<i64, _>(5)? != 0,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let truncated = (total as usize) > items.len();
+    Ok((items, truncated))
+}
+
+/// Marks inbox items read for a device. Only `seq`s belonging to `device_id`
+/// are touched; unknown ids are silently ignored (cannot create content).
+/// Returns the seqs actually acked (those that transitioned to read), in the
+/// order sent. Bumps the device version only if something changed.
+pub async fn mark_inbox_read(db: &Db, device_id: &str, seqs: &[u64]) -> Result<Vec<u64>> {
+    if seqs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut tx = db.pool.begin().await?;
+    let mut acked = Vec::new();
+    for seq in seqs {
+        let res = sqlx::query(&db.adapt(
+            "UPDATE inbox SET read = 1, updated_at = ? WHERE device_id = ? AND seq = ? AND read = 0",
+        ))
+        .bind(now_unix())
+        .bind(device_id)
+        .bind(*seq as i64)
+        .execute(&mut *tx)
+        .await?;
+        if res.rows_affected() > 0 {
+            acked.push(*seq);
+        }
+    }
+    if !acked.is_empty() {
+        bump_version(db, &mut *tx, device_id).await?;
+    }
+    tx.commit().await?;
+    Ok(acked)
+}
+
+/// Management/debug helper: delete a single inbox item for a device.
+pub async fn delete_inbox_item(db: &Db, device_id: &str, seq: u64) -> Result<bool> {
+    let res = sqlx::query(&db.adapt("DELETE FROM inbox WHERE device_id = ? AND seq = ?"))
+        .bind(device_id)
+        .bind(seq as i64)
+        .execute(&db.pool)
+        .await?;
+    if res.rows_affected() > 0 {
+        bump_version(db, &db.pool, device_id).await?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Management/debug helper: clear read inbox history for a device.
+pub async fn clear_read_inbox(db: &Db, device_id: &str) -> Result<()> {
+    let res = sqlx::query(&db.adapt("DELETE FROM inbox WHERE device_id = ? AND read = 1"))
+        .bind(device_id)
+        .execute(&db.pool)
+        .await?;
+    if res.rows_affected() > 0 {
+        bump_version(db, &db.pool, device_id).await?;
+    }
+    Ok(())
+}
+
 // --- Column helpers (shared by both backends) -----------------------------
 
 /// Parses the `importance` column; unknown/legacy values fall back to
@@ -1034,6 +1518,7 @@ mod tests {
                         importance: None,
                     },
                 ],
+                inbox_read: vec![],
             },
         )
         .await
@@ -1075,5 +1560,160 @@ mod tests {
         assert!(delete_account(&db, account.id).await.unwrap());
         assert!(!delete_account(&db, account.id).await.unwrap());
         assert!(list_devices(&db).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn webhook_channel_delivers_unique_seq_and_idempotent_dedup() {
+        let db = memory_db().await;
+        let device = register_device(&db, "dev", None).await.unwrap();
+        let (channel, token) = create_channel(&db, &device.id, "webhook", "CI", None)
+            .await
+            .unwrap();
+        assert!(token.unwrap().starts_with("ipwh_"));
+
+        // Concurrent-ish sequential deliveries must get increasing, unique seq.
+        let (seq1, created1) = deliver_inbox(
+            &db,
+            &device.id,
+            &channel.id,
+            "alert",
+            "Build failed",
+            "main",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let (seq2, created2) = deliver_inbox(
+            &db,
+            &device.id,
+            &channel.id,
+            "info",
+            "Build ok",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(created1 && created2);
+        assert_eq!(seq1, 1);
+        assert_eq!(seq2, 2);
+        assert_ne!(seq1, seq2);
+
+        // Idempotency: same source_ref returns the same seq without a new row.
+        let (seq_orig, created_orig) = deliver_inbox(
+            &db,
+            &device.id,
+            &channel.id,
+            "alert",
+            "Build failed",
+            "main",
+            None,
+            Some("key-1"),
+        )
+        .await
+        .unwrap();
+        let (seq_replay, created_replay) = deliver_inbox(
+            &db,
+            &device.id,
+            &channel.id,
+            "alert",
+            "Build failed",
+            "main",
+            None,
+            Some("key-1"),
+        )
+        .await
+        .unwrap();
+        assert!(created_orig);
+        assert!(!created_replay);
+        assert_eq!(seq_orig, seq_replay);
+
+        // Read merge only affects this device and acks what was marked.
+        let (_items, truncated) = list_inbox(&db, &device.id, 20).await.unwrap();
+        assert!(!truncated);
+        let acked = mark_inbox_read(&db, &device.id, &[seq1]).await.unwrap();
+        assert_eq!(acked, vec![seq1]);
+        let (items2, _) = list_inbox(&db, &device.id, 20).await.unwrap();
+        assert!(items2.iter().find(|i| i.id == seq1).unwrap().read);
+        // Re-marking an already-read item returns nothing (no double ack).
+        assert!(mark_inbox_read(&db, &device.id, &[seq1])
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn channel_ownership_and_rotate() {
+        let db = memory_db().await;
+        let device = register_device(&db, "dev", None).await.unwrap();
+        let (channel, _) = create_channel(&db, &device.id, "webhook", "CI", None)
+            .await
+            .unwrap();
+
+        // Wrong device cannot fetch this channel.
+        let other = register_device(&db, "other", None).await.unwrap();
+        assert!(get_channel(&db, &other.id, &channel.id)
+            .await
+            .unwrap()
+            .is_none());
+
+        // Rotate changes the token (verifiable via a changed hash check).
+        let new_token = rotate_channel_token(&db, &device.id, &channel.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(new_token.starts_with("ipwh_"));
+        assert_ne!(
+            get_channel(&db, &device.id, &channel.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .token_prefix,
+            channel.token_prefix
+        );
+
+        // Rotate on a non-webhook channel returns None.
+        assert!(rotate_channel_token(&db, &device.id, "does-not-exist")
+            .await
+            .unwrap()
+            .is_none());
+
+        // Deleting a channel cascades its inbox.
+        deliver_inbox(&db, &device.id, &channel.id, "info", "x", "", None, None)
+            .await
+            .unwrap();
+        assert!(delete_channel(&db, &device.id, &channel.id).await.unwrap());
+        let (items, _) = list_inbox(&db, &device.id, 20).await.unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inbox_capacity_is_capped() {
+        let db = memory_db().await;
+        let device = register_device(&db, "dev", None).await.unwrap();
+        let (channel, _) = create_channel(&db, &device.id, "webhook", "CI", None)
+            .await
+            .unwrap();
+        for i in 0..30 {
+            deliver_inbox(
+                &db,
+                &device.id,
+                &channel.id,
+                "info",
+                &format!("m{i}"),
+                "",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let (items, truncated) = list_inbox(&db, &device.id, 20).await.unwrap();
+        assert_eq!(items.len(), 20);
+        assert!(truncated);
+        // Newest seq first (seq DESC).
+        assert_eq!(items[0].id, 30);
     }
 }

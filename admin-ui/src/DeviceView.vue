@@ -2,7 +2,7 @@
 import { inject, onMounted, ref, watch } from "vue";
 import * as api from "./lib/api";
 import { uiKey } from "./lib/ui";
-import type { Alarm, Device, Repeat, Todo, TodoDue } from "./lib/types";
+import type { Alarm, Channel, Device, InboxItem, Repeat, Todo, TodoDue } from "./lib/types";
 
 const props = defineProps<{ device: Device }>();
 
@@ -15,6 +15,11 @@ const ui = inject(uiKey)!;
 
 const alarms = ref<Alarm[]>([]);
 const todos = ref<Todo[]>([]);
+const channels = ref<Channel[]>([]);
+const inbox = ref<InboxItem[]>([]);
+const pendingToken = ref<{ channel: Channel; token: string; url: string } | null>(null);
+const newChannelName = ref("");
+const newChannelKind = ref<"webhook" | "caldav_basic">("webhook");
 
 const alarmHour = ref(7);
 const alarmMinute = ref(0);
@@ -35,13 +40,17 @@ let loadSeq = 0;
 async function loadContent() {
   const id = props.device.id;
   const seq = ++loadSeq;
-  const [a, t] = await Promise.all([
+  const [a, t, c, i] = await Promise.all([
     handle(api.listAlarms(ui.authToken(), id)),
     handle(api.listTodos(ui.authToken(), id)),
+    handle(api.listChannels(ui.authToken(), id)),
+    handle(api.listInbox(ui.authToken(), id)),
   ]);
   if (seq !== loadSeq) return;
   if (a !== null) alarms.value = a;
   if (t !== null) todos.value = t;
+  if (c !== null) channels.value = c;
+  if (i !== null) inbox.value = i;
 }
 
 async function handle<T>(pending: Promise<api.Result<T>>): Promise<T | null> {
@@ -218,6 +227,81 @@ async function clearTodos() {
   ui.toast("All todos cleared");
 }
 
+// --- Channels & inbox ------------------------------------------------------
+
+async function addChannel() {
+  const name = newChannelName.value.trim();
+  if (!name) {
+    ui.toast("Enter a channel name", "error");
+    return;
+  }
+  if (newChannelKind.value === "caldav_basic") {
+    ui.toast("CalDAV is not implemented yet", "error");
+    return;
+  }
+  const created = await ui.run("add-channel", () =>
+    api.createChannel(ui.authToken(), props.device.id, "webhook", name),
+  );
+  if (created === null) return;
+  if (created.token) {
+    pendingToken.value = {
+      channel: created.channel,
+      token: created.token,
+      url: created.delivery_url ?? "",
+    };
+  }
+  newChannelName.value = "";
+  await loadContent();
+  if (pendingToken.value) ui.toast("Webhook channel created — copy its token now (shown once)");
+}
+
+async function removeChannel(c: Channel) {
+  if (!(await ui.confirmDialog(`Delete channel "${c.name}" and its messages?`))) return;
+  const ok = await ui.run("delete-channel", () =>
+    api.deleteChannel(ui.authToken(), props.device.id, c.id),
+  );
+  if (ok === null) return;
+  await loadContent();
+}
+
+async function rotateToken(c: Channel) {
+  const res = await ui.run("rotate-token", () =>
+    api.rotateChannelToken(ui.authToken(), props.device.id, c.id),
+  );
+  if (res === null) return;
+  pendingToken.value = {
+    channel: c,
+    token: res.token,
+    url: `/api/channels/${c.id}/messages`,
+  };
+  await loadContent();
+  ui.toast("Token rotated — the old one no longer works");
+}
+
+function copyText(text: string) {
+  void navigator.clipboard?.writeText(text);
+  ui.toast("Copied to clipboard");
+}
+
+function copyToken() {
+  if (pendingToken.value) copyText(pendingToken.value.token);
+}
+
+async function deleteInboxItem(seq: number) {
+  const ok = await ui.run("delete-inbox", () =>
+    api.deleteInboxItem(ui.authToken(), props.device.id, seq),
+  );
+  if (ok === null) return;
+  await loadContent();
+}
+
+async function clearInbox() {
+  if (!(await ui.confirmDialog("Delete all read inbox messages?"))) return;
+  const ok = await ui.run("clear-inbox", () => api.clearInbox(ui.authToken(), props.device.id));
+  if (ok === null) return;
+  await loadContent();
+}
+
 // --- Display helpers ---------------------------------------------------------
 
 function pad(n: number): string {
@@ -370,6 +454,73 @@ watch(() => props.device.id, loadContent);
           Clear todos
         </button>
       </form>
+    </div>
+
+    <form class="card" style="--i: 5; margin-top: 16px" @submit.prevent="addChannel">
+      <div class="card-head">
+        <h2><span class="index">03</span>Channels</h2>
+        <span class="count">{{ channels.length }}</span>
+      </div>
+      <p class="hint">
+        External sources that push notifications to this device. A webhook channel
+        gives you a token so CI, agents or scripts can deliver messages.
+      </p>
+      <div class="row">
+        <input v-model="newChannelName" class="grow" placeholder="Channel name (e.g. CI)" :disabled="ui.isBusy('add-channel')" />
+        <select v-model="newChannelKind">
+          <option value="webhook">Webhook</option>
+          <option value="caldav_basic" disabled>CalDAV (soon)</option>
+        </select>
+        <button class="primary" type="submit" :disabled="ui.isBusy('add-channel')">
+          {{ ui.isBusy("add-channel") ? "Creating…" : "Create" }}
+        </button>
+      </div>
+      <div class="list">
+        <div v-if="channels.length === 0" class="empty">No channels yet</div>
+        <div v-for="c in channels" :key="c.id" class="item" :class="{ off: !c.enabled }">
+          <span class="text">
+            <b>{{ c.name }}</b>
+            <span class="meta">{{ c.kind }} · {{ c.enabled ? "enabled" : "disabled" }} · token {{ c.token_prefix }}…</span>
+          </span>
+          <button class="imp" type="button" title="Rotate token (old one stops working)" :disabled="ui.isBusy('rotate-token')" @click="rotateToken(c)">Rotate</button>
+          <button class="danger" type="button" :disabled="ui.isBusy('delete-channel')" @click="removeChannel(c)">Delete</button>
+        </div>
+      </div>
+    </form>
+
+    <div class="card" style="--i: 6; margin-top: 16px">
+      <div class="card-head">
+        <h2><span class="index">04</span>Inbox</h2>
+        <span class="count">{{ inbox.length }}</span>
+      </div>
+      <div class="list">
+        <div v-if="inbox.length === 0" class="empty">No messages</div>
+        <div v-for="m in inbox" :key="m.id" class="item" :class="{ done: m.read }">
+          <span class="text">
+            <b>{{ m.title }}</b>
+            <span class="meta">{{ m.kind }} · {{ m.read ? "read" : "unread" }}{{ m.when ? " · " + new Date(m.when * 1000).toLocaleString() : "" }}</span>
+            <template v-if="m.body"><br /><span class="meta">{{ m.body }}</span></template>
+          </span>
+          <button class="danger" type="button" :disabled="ui.isBusy('delete-inbox')" @click="deleteInboxItem(m.id)">Delete</button>
+        </div>
+      </div>
+      <button class="danger" type="button" style="margin-top: 14px" @click="clearInbox">
+        Clear read messages
+      </button>
+    </div>
+
+    <div v-if="pendingToken" class="modal-backdrop" @click.self="pendingToken = null">
+      <div class="modal">
+        <h3>Webhook token (shown once)</h3>
+        <p class="hint">Copy this token now — it is never shown again. Anyone holding it can post messages to this channel.</p>
+        <pre class="token">{{ pendingToken.token }}</pre>
+        <p class="hint">Delivery URL:</p>
+        <pre class="token">{{ pendingToken.url }}</pre>
+        <div class="row">
+          <button class="primary" type="button" @click="copyToken">Copy token</button>
+          <button class="quiet" type="button" @click="pendingToken = null">Close</button>
+        </div>
+      </div>
     </div>
   </div>
 </template>
