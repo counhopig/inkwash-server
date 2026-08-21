@@ -795,8 +795,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "inkpaper-server"
-version = "0.3.0"
+name = "inkwash-server"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "argon2",
