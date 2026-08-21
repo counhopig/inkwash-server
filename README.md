@@ -67,10 +67,15 @@ via the "server owner" link) and register devices.
 - `GET /api/sync` — device-facing (`Bearer <device_token>`), ETag/304
   conditional pull (legacy; kept for older firmware).
 - `POST /api/sync` — device-facing (`Bearer <device_token>`): uploads
-  `enabled`/`done`/importance flags and `inbox_read` seqs, merges them
-  (unknown IDs ignored), returns the authoritative `{alarms, todos, inbox}`
-  list plus an `inbox_read_acked` echo and an `inbox_truncated` flag. This
-  is what current firmware calls — contract in the firmware repo's
+  locally-changed `enabled`/`done`/importance flags and `inbox_read` seqs,
+  merges them (unknown IDs ignored), returns the authoritative
+  `{alarms, todos, inbox}` list plus an `inbox_read_acked` echo and an
+  `inbox_truncated` flag. A request with `X-Inkpaper-Poll: 1` is a
+  **lightweight urgent poll**: the server answers immediately with
+  `{"urgent": true|false}` — no merge, no full payload — so the firmware
+  can check for high-priority messages on a short cron cadence without
+  pulling everything. This is what current firmware calls — contract in
+  the firmware repo's
   [`docs/sync-api.md`](https://github.com/counhopig/inkpaper-firmware/blob/main/docs/sync-api.md).
 - `POST/GET/DELETE /api/devices[/:id]` — admin. `Bearer <ADMIN_TOKEN>` sees
   every device; a console-account session sees only its own devices.
@@ -82,9 +87,11 @@ via the "server owner" link) and register devices.
   list, update, delete, `POST .../rotate-token`.
 - `POST /api/channels/:channel_id/messages` — **webhook delivery**:
   `Bearer <channel_token>` (a per-channel token, distinct from admin/device
-  tokens), payload `{kind, title, body, when?}` with size limits, an
-  optional `Idempotency-Key` header for dedup. Inserts an inbox item and
-  bumps the device's sync version.
+  tokens), payload `{kind, title, body, priority?, when?}` with size
+  limits, an optional `Idempotency-Key` header for dedup. `priority:
+  "high"` marks the message urgent — the device shows a full-screen
+  reminder and rings immediately. Inserts an inbox item and bumps the
+  device's sync version.
 - `/api/devices/:id/inbox` — admin debug view: `GET` (paged), `DELETE :seq`
   (single), `DELETE` (clear read messages).
 - `/api/auth/register|login|logout` — console accounts. Register/login
@@ -109,7 +116,8 @@ The embedded UI is a small Vue 3 app split into layered views (no router):
 - **Dashboard** — stat strip (devices/alarms/todos/done), device cards,
   register-device.
 - **Device** — alarms/todos editor for one device (add, toggle enabled /
-  done, priority, delete, clear).
+  done, priority, delete, clear), plus **channels** (create/rotate webhook
+  tokens) and the device **inbox** (view/delete messages).
 - **Account** — session info, change password; when signed in with the
   `ADMIN_TOKEN`, an admin **Users** panel to list / delete accounts and
   reset their passwords.

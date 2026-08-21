@@ -5,7 +5,24 @@ All notable changes to **inkpaper-server** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-08-21
+
+### Added
+- **Webhook channels** — per-device channels with one-time delivery
+  tokens (`POST /api/devices/:id/channels`, `.../rotate-token`), and
+  `POST /api/channels/:channel_id/messages` webhook delivery: size
+  limits, optional `Idempotency-Key` dedup, and `priority: "high"`
+  flagging that drives the device's urgent reminder.
+- **Device inbox** — `inbox` table, `inbox_read_acked` / `inbox_truncated`
+  sync fields, admin inbox debug endpoints (`GET`/`DELETE`), and the
+  `has_unread_high_inbox` query backing urgent delivery.
+- **Lightweight urgent poll** — `X-Inkpaper-Poll: 1` on `POST /api/sync`
+  answers `{"urgent": bool}` immediately (no merge, no full payload), so
+  the firmware can poll for high-priority messages on a short cron
+  cadence without pulling everything.
+- **Console UI** — channels & inbox management in the Device view:
+  create webhook channels, copy/rotate the delivery token, and view /
+  delete inbox messages.
 
 ## [0.2.0] - 2026-08-20
 
