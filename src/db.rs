@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::models::{
     Account, AccountSummary, Alarm, Channel, Device, DeviceSyncRequest, Importance, InboxItem,
-    InboxKind, Repeat, Todo, UpsertAlarmRequest, UpsertTodoRequest,
+    InboxKind, Priority, Repeat, Todo, UpsertAlarmRequest, UpsertTodoRequest,
 };
 
 /// Wraps the sqlx `Any` pool plus the backend flag. Data SQL is written with
@@ -122,6 +122,7 @@ const SQLITE_TABLES: &str = "
         event_id TEXT,
         seq INTEGER NOT NULL,
         kind TEXT NOT NULL,
+        priority TEXT NOT NULL DEFAULT 'normal',
         title TEXT NOT NULL,
         body TEXT,
         when_epoch INTEGER,
@@ -211,6 +212,7 @@ const POSTGRES_TABLES: &str = "
         event_id TEXT,
         seq BIGINT NOT NULL,
         kind TEXT NOT NULL,
+        priority TEXT NOT NULL DEFAULT 'normal',
         title TEXT NOT NULL,
         body TEXT,
         when_epoch BIGINT,
@@ -287,6 +289,7 @@ pub async fn open(url: &str, max_connections: u32) -> Result<Db> {
             "ALTER TABLE todos ADD COLUMN repeat_days TEXT",
             "ALTER TABLE alarms ADD COLUMN repeat_days TEXT",
             "ALTER TABLE devices ADD COLUMN account_id INTEGER",
+            "ALTER TABLE inbox ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'",
         ] {
             let _ = sqlx::raw_sql(stmt).execute(&db.pool).await;
         }
@@ -1152,6 +1155,7 @@ async fn insert_inbox_with_seq(
     device_id: &str,
     channel_id: &str,
     kind: &str,
+    priority: &str,
     title: &str,
     body: &str,
     when: Option<i64>,
@@ -1196,14 +1200,15 @@ async fn insert_inbox_with_seq(
     };
     let now = now_unix();
     sqlx::query(&db.adapt(
-        "INSERT INTO inbox (id, device_id, channel_id, seq, kind, title, body, when_epoch, source_ref, read, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+        "INSERT INTO inbox (id, device_id, channel_id, seq, kind, priority, title, body, when_epoch, source_ref, read, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
     ))
     .bind(id)
     .bind(device_id)
     .bind(channel_id)
     .bind(seq)
     .bind(kind)
+    .bind(priority)
     .bind(title)
     .bind(body)
     .bind(when)
@@ -1224,6 +1229,7 @@ pub async fn deliver_inbox(
     device_id: &str,
     channel_id: &str,
     kind: &str,
+    priority: &str,
     title: &str,
     body: &str,
     when: Option<i64>,
@@ -1245,7 +1251,7 @@ pub async fn deliver_inbox(
     }
     let id = new_uuid();
     let seq = insert_inbox_with_seq(
-        db, &mut tx, &id, device_id, channel_id, kind, title, body, when, source_ref,
+        db, &mut tx, &id, device_id, channel_id, kind, priority, title, body, when, source_ref,
     )
     .await?;
     bump_version(db, &mut *tx, device_id).await?;
@@ -1262,7 +1268,7 @@ pub async fn list_inbox(db: &Db, device_id: &str, limit: usize) -> Result<(Vec<I
             .fetch_one(&db.pool)
             .await?;
     let rows = sqlx::query(&db.adapt(
-        "SELECT seq, kind, title, body, when_epoch, read FROM inbox
+        "SELECT seq, kind, priority, title, body, when_epoch, read FROM inbox
          WHERE device_id = ? ORDER BY read ASC, seq DESC LIMIT ?",
     ))
     .bind(device_id)
@@ -1275,10 +1281,11 @@ pub async fn list_inbox(db: &Db, device_id: &str, limit: usize) -> Result<(Vec<I
             Ok(InboxItem {
                 id: r.try_get::<i64, _>(0)? as u64,
                 kind: InboxKind::from(r.try_get::<String, _>(1)?.as_str()),
-                title: r.try_get(2)?,
-                body: r.try_get::<Option<String>, _>(3)?.unwrap_or_default(),
-                when: r.try_get(4)?,
-                read: r.try_get::<i64, _>(5)? != 0,
+                priority: Priority::from(r.try_get::<String, _>(2)?.as_str()),
+                title: r.try_get(3)?,
+                body: r.try_get::<Option<String>, _>(4)?.unwrap_or_default(),
+                when: r.try_get(5)?,
+                read: r.try_get::<i64, _>(6)? != 0,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1341,6 +1348,19 @@ pub async fn clear_read_inbox(db: &Db, device_id: &str) -> Result<()> {
         bump_version(db, &db.pool, device_id).await?;
     }
     Ok(())
+}
+
+/// Whether the device has any unread `high`-priority inbox items. Used by the
+/// long-poll wait so the server can return immediately when an urgent message
+/// arrives, without the device polling on a timer.
+pub async fn has_unread_high_inbox(db: &Db, device_id: &str) -> Result<bool> {
+    let count: i64 = sqlx::query_scalar(&db.adapt(
+        "SELECT COUNT(*) FROM inbox WHERE device_id = ? AND read = 0 AND priority = 'high'",
+    ))
+    .bind(device_id)
+    .fetch_one(&db.pool)
+    .await?;
+    Ok(count > 0)
 }
 
 // --- Column helpers (shared by both backends) -----------------------------
@@ -1577,6 +1597,7 @@ mod tests {
             &device.id,
             &channel.id,
             "alert",
+            "normal",
             "Build failed",
             "main",
             None,
@@ -1589,6 +1610,7 @@ mod tests {
             &device.id,
             &channel.id,
             "info",
+            "normal",
             "Build ok",
             "",
             None,
@@ -1607,6 +1629,7 @@ mod tests {
             &device.id,
             &channel.id,
             "alert",
+            "normal",
             "Build failed",
             "main",
             None,
@@ -1619,6 +1642,7 @@ mod tests {
             &device.id,
             &channel.id,
             "alert",
+            "normal",
             "Build failed",
             "main",
             None,
@@ -1681,9 +1705,19 @@ mod tests {
             .is_none());
 
         // Deleting a channel cascades its inbox.
-        deliver_inbox(&db, &device.id, &channel.id, "info", "x", "", None, None)
-            .await
-            .unwrap();
+        deliver_inbox(
+            &db,
+            &device.id,
+            &channel.id,
+            "info",
+            "normal",
+            "x",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(delete_channel(&db, &device.id, &channel.id).await.unwrap());
         let (items, _) = list_inbox(&db, &device.id, 20).await.unwrap();
         assert!(items.is_empty());
@@ -1702,6 +1736,7 @@ mod tests {
                 &device.id,
                 &channel.id,
                 "info",
+                "normal",
                 &format!("m{i}"),
                 "",
                 None,
@@ -1715,5 +1750,55 @@ mod tests {
         assert!(truncated);
         // Newest seq first (seq DESC).
         assert_eq!(items[0].id, 30);
+    }
+
+    #[tokio::test]
+    async fn inbox_priority_roundtrips_and_drives_urgent_flag() {
+        let db = memory_db().await;
+        let device = register_device(&db, "dev", None).await.unwrap();
+        let (channel, _) = create_channel(&db, &device.id, "webhook", "CI", None)
+            .await
+            .unwrap();
+
+        deliver_inbox(
+            &db,
+            &device.id,
+            &channel.id,
+            "info",
+            "normal",
+            "normal msg",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        deliver_inbox(
+            &db,
+            &device.id,
+            &channel.id,
+            "alert",
+            "high",
+            "urgent msg",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (items, _) = list_inbox(&db, &device.id, 20).await.unwrap();
+        assert_eq!(items.len(), 2);
+        let urgent = items.iter().find(|i| i.title == "urgent msg").unwrap();
+        assert_eq!(urgent.priority, crate::models::Priority::High);
+        let normal = items.iter().find(|i| i.title == "normal msg").unwrap();
+        assert_eq!(normal.priority, crate::models::Priority::Normal);
+
+        // has_unread_high_inbox is true while the urgent one is unread.
+        assert!(has_unread_high_inbox(&db, &device.id).await.unwrap());
+
+        // Marking the urgent one read clears the flag.
+        mark_inbox_read(&db, &device.id, &[urgent.id]).await.unwrap();
+        assert!(!has_unread_high_inbox(&db, &device.id).await.unwrap());
     }
 }

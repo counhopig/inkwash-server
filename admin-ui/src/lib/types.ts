@@ -86,10 +86,12 @@ export interface ChannelCreated {
 }
 
 export type InboxKind = "alert" | "event" | "info";
+export type InboxPriority = "normal" | "high";
 
 export interface InboxItem {
   id: number;
   kind: InboxKind;
+  priority: InboxPriority;
   title: string;
   body: string;
   when: number | null;

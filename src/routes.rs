@@ -531,6 +531,36 @@ async fn device_push_sync(
         Ok(version) => version,
         Err(err) => return internal_error(err),
     };
+
+    // Long-poll: when the device asks with `X-Inkpaper-Wait`, hold the
+    // connection (polling every 500ms) until an unread high-priority inbox
+    // message arrives or the timeout elapses, so urgent messages surface
+    // in real time without the device hammering the server on a timer. The
+    // device keeps one connection open (Wi-Fi stays connected), which is
+    // both more real-time and gentler on the radio than repeated connects.
+    let wants_wait = headers
+        .get("x-inkpaper-wait")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if wants_wait {
+        let wait_secs = LONG_POLL_TIMEOUT_SECS;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
+        loop {
+            let has_urgent = match db::has_unread_high_inbox(&state.db, &device_id).await {
+                Ok(v) => v,
+                Err(err) => return internal_error(err),
+            };
+            if has_urgent {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+
     let body = match build_sync_response(&state, &device_id, &req.inbox_read).await {
         Ok(body) => Json(body),
         Err(resp) => return resp.into_response(),
@@ -539,6 +569,7 @@ async fn device_push_sync(
     tracing::info!(
         device_id,
         version,
+        wait = wants_wait,
         alarm_count = body.0.alarms.len(),
         todo_count = body.0.todos.len(),
         inbox_count = body.0.inbox.len(),
@@ -546,6 +577,11 @@ async fn device_push_sync(
     );
     (StatusCode::OK, [(axum::http::header::ETAG, etag)], body).into_response()
 }
+
+/// How long a long-polling sync request holds the connection waiting for an
+/// urgent message before returning an empty wait (timeout). Kept modest so a
+/// hung device can't pin a connection forever.
+const LONG_POLL_TIMEOUT_SECS: u64 = 30;
 
 // --- Admin: devices -----------------------------------------------------
 
@@ -797,6 +833,14 @@ fn validate_inbox_payload(req: &InboxCreateRequest) -> Result<(), &'static str> 
             return Err("when is outside a valid Unix epoch range");
         }
     }
+    if let Some(priority) = req.priority {
+        if !matches!(
+            priority,
+            crate::models::Priority::Normal | crate::models::Priority::High
+        ) {
+            return Err("priority must be one of 'normal' | 'high'");
+        }
+    }
     Ok(())
 }
 
@@ -966,11 +1010,16 @@ async fn deliver_inbox(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
+    let priority = req.priority.unwrap_or(crate::models::Priority::Normal);
     match db::deliver_inbox(
         &state.db,
         &device_id,
         &channel_id,
         req.kind.as_str(),
+        match priority {
+            crate::models::Priority::High => "high",
+            crate::models::Priority::Normal => "normal",
+        },
         req.title.trim(),
         req.body.trim(),
         req.when,

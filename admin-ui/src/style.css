@@ -215,6 +215,20 @@ h2 {
   color: var(--muted);
 }
 
+.urgent-mark {
+  font-weight: 800;
+  color: var(--ink);
+  background: repeating-linear-gradient(
+    135deg,
+    transparent,
+    transparent 4px,
+    var(--hatch) 4px,
+    var(--hatch) 5px
+  );
+  padding: 0 4px;
+  margin-right: 4px;
+}
+
 .content-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;

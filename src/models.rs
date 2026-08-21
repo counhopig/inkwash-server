@@ -110,6 +110,27 @@ impl From<&str> for InboxKind {
     }
 }
 
+/// Inbox notification priority, serialized snake_case to match the
+/// firmware's `Priority`. `High` drives on-device urgent behavior: the
+/// firmware shows a full-screen reminder with an insistent tone as soon as
+/// the message arrives on the next sync. `Normal` is the default.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Priority {
+    #[default]
+    Normal,
+    High,
+}
+
+impl From<&str> for Priority {
+    fn from(s: &str) -> Self {
+        match s {
+            "high" => Priority::High,
+            _ => Priority::Normal,
+        }
+    }
+}
+
 /// A single inbox notification as seen by the device over the sync wire.
 /// `id` is the device-visible stable `seq` (u64); the server's internal
 /// UUID id is never sent to the device.
@@ -117,6 +138,8 @@ impl From<&str> for InboxKind {
 pub struct InboxItem {
     pub id: u64,
     pub kind: InboxKind,
+    #[serde(default)]
+    pub priority: Priority,
     pub title: String,
     #[serde(default)]
     pub body: String,
@@ -316,6 +339,8 @@ pub struct ChannelCreated {
 #[derive(Clone, Debug, Deserialize)]
 pub struct InboxCreateRequest {
     pub kind: String,
+    #[serde(default)]
+    pub priority: Option<Priority>,
     pub title: String,
     #[serde(default)]
     pub body: String,

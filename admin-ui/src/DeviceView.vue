@@ -498,7 +498,10 @@ watch(() => props.device.id, loadContent);
         <div v-for="m in inbox" :key="m.id" class="item" :class="{ done: m.read }">
           <span class="text">
             <b>{{ m.title }}</b>
-            <span class="meta">{{ m.kind }} · {{ m.read ? "read" : "unread" }}{{ m.when ? " · " + new Date(m.when * 1000).toLocaleString() : "" }}</span>
+            <span class="meta">
+              <span v-if="m.priority === 'high'" class="urgent-mark">!! urgent</span>
+              {{ m.kind }} · {{ m.read ? "read" : "unread" }}{{ m.when ? " · " + new Date(m.when * 1000).toLocaleString() : "" }}
+            </span>
             <template v-if="m.body"><br /><span class="meta">{{ m.body }}</span></template>
           </span>
           <button class="danger" type="button" :disabled="ui.isBusy('delete-inbox')" @click="deleteInboxItem(m.id)">Delete</button>
