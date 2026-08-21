@@ -527,40 +527,29 @@ async fn device_push_sync(
         Ok(None) => return (StatusCode::UNAUTHORIZED, "unknown device token").into_response(),
         Err(err) => return internal_error(err),
     };
+
+    // Lightweight poll: the device asks with `X-Inkpaper-Poll: 1` to check
+    // for unread urgent (high-priority) messages without pulling the whole
+    // sync payload. Returns immediately (no hold, no merge, no full body) so
+    // the firmware can poll frequently for urgent messages on a short timer
+    // without keeping a long connection open or blocking its main loop.
+    let wants_poll = headers
+        .get("x-inkpaper-poll")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if wants_poll {
+        let urgent = match db::has_unread_high_inbox(&state.db, &device_id).await {
+            Ok(v) => v,
+            Err(err) => return internal_error(err),
+        };
+        return Json(serde_json::json!({ "urgent": urgent })).into_response();
+    }
+
     let version = match db::merge_device_state(&state.db, &device_id, &req).await {
         Ok(version) => version,
         Err(err) => return internal_error(err),
     };
-
-    // Long-poll: when the device asks with `X-Inkpaper-Wait`, hold the
-    // connection (polling every 500ms) until an unread high-priority inbox
-    // message arrives or the timeout elapses, so urgent messages surface
-    // in real time without the device hammering the server on a timer. The
-    // device keeps one connection open (Wi-Fi stays connected), which is
-    // both more real-time and gentler on the radio than repeated connects.
-    let wants_wait = headers
-        .get("x-inkpaper-wait")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    if wants_wait {
-        let wait_secs = LONG_POLL_TIMEOUT_SECS;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
-        loop {
-            let has_urgent = match db::has_unread_high_inbox(&state.db, &device_id).await {
-                Ok(v) => v,
-                Err(err) => return internal_error(err),
-            };
-            if has_urgent {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        }
-    }
-
     let body = match build_sync_response(&state, &device_id, &req.inbox_read).await {
         Ok(body) => Json(body),
         Err(resp) => return resp.into_response(),
@@ -569,7 +558,6 @@ async fn device_push_sync(
     tracing::info!(
         device_id,
         version,
-        wait = wants_wait,
         alarm_count = body.0.alarms.len(),
         todo_count = body.0.todos.len(),
         inbox_count = body.0.inbox.len(),
@@ -577,11 +565,6 @@ async fn device_push_sync(
     );
     (StatusCode::OK, [(axum::http::header::ETAG, etag)], body).into_response()
 }
-
-/// How long a long-polling sync request holds the connection waiting for an
-/// urgent message before returning an empty wait (timeout). Kept modest so a
-/// hung device can't pin a connection forever.
-const LONG_POLL_TIMEOUT_SECS: u64 = 30;
 
 // --- Admin: devices -----------------------------------------------------
 
