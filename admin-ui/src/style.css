@@ -344,6 +344,13 @@ label {
   min-width: 0;
 }
 
+.item .text .meta {
+  display: block;
+  margin-top: 2px;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
 .item b {
   font-size: 17px;
 }

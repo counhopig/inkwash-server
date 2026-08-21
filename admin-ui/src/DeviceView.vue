@@ -482,7 +482,7 @@ watch(() => props.device.id, loadContent);
             <b>{{ c.name }}</b>
             <span class="meta">{{ c.kind }} · {{ c.enabled ? "enabled" : "disabled" }} · token {{ c.token_prefix }}…</span>
           </span>
-          <button class="imp" type="button" title="Rotate token (old one stops working)" :disabled="ui.isBusy('rotate-token')" @click="rotateToken(c)">Rotate</button>
+          <button class="quiet" type="button" title="Rotate token (old one stops working)" :disabled="ui.isBusy('rotate-token')" @click="rotateToken(c)">Rotate</button>
           <button class="danger" type="button" :disabled="ui.isBusy('delete-channel')" @click="removeChannel(c)">Delete</button>
         </div>
       </div>
