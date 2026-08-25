@@ -158,8 +158,12 @@ where
 }
 
 pub async fn list_alarms(db: &Db, device_id: &str) -> Result<Vec<Alarm>> {
-    let rows = sqlx::query(&db.adapt("SELECT local_id, hour, minute, repeat_kind, once_year, once_month, once_day, repeat_days, enabled, label
-         FROM alarms WHERE device_id = ? ORDER BY local_id"))
+    let rows = sqlx::query(db.sql(
+        "SELECT local_id, hour, minute, repeat_kind, once_year, once_month, once_day, repeat_days, enabled, label
+         FROM alarms WHERE device_id = ? ORDER BY local_id",
+        "SELECT local_id, hour, minute, repeat_kind, once_year, once_month, once_day, repeat_days, enabled, label
+         FROM alarms WHERE device_id = $1 ORDER BY local_id",
+    ))
     .bind(device_id)
     .fetch_all(&db.pool)
     .await?;

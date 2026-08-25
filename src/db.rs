@@ -35,6 +35,19 @@ pub struct Db {
 }
 
 impl Db {
+    /// Picks between the explicitly maintained SQLite and PostgreSQL forms of
+    /// one statement. The two must say the same thing - same tables, columns
+    /// and bind order - and differ only in placeholder style (`?` vs
+    /// `$1, $2, …`). Statements without placeholders are dialect-neutral and
+    /// don't need this helper.
+    pub(crate) fn sql<'a>(&self, sqlite: &'a str, postgres: &'a str) -> &'a str {
+        if self.postgres {
+            postgres
+        } else {
+            sqlite
+        }
+    }
+
     fn adapt(&self, sql: &str) -> String {
         if !self.postgres {
             return sql.to_string();
@@ -59,14 +72,21 @@ mod tests {
     use crate::models::{
         DeviceSyncRequest, Importance, Repeat, UpsertAlarmRequest, UpsertTodoRequest,
     };
+    use uuid::Uuid;
 
-    async fn memory_db() -> Db {
-        open("sqlite::memory:", 1).await.expect("open in-memory db")
+    /// Opens the database under test. Honors `DATABASE_URL` so the same suite
+    /// exercises PostgreSQL too (`DATABASE_URL=postgres://… cargo test`);
+    /// defaults to a throwaway in-memory SQLite database. Tests only assert
+    /// on rows they created themselves, so they are safe to point at a shared
+    /// database that holds unrelated data.
+    async fn test_db() -> Db {
+        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite::memory:".to_string());
+        open(&url, 1).await.expect("open test db")
     }
 
     #[tokio::test]
     async fn bulk_clear_preserves_device_and_other_content() {
-        let db = memory_db().await;
+        let db = test_db().await;
         let device = register_device(&db, "test", None).await.unwrap();
         upsert_alarm(
             &db,
@@ -117,12 +137,17 @@ mod tests {
                 day: 25
             })
         );
-        assert_eq!(list_devices(&db).await.unwrap().len(), 1);
+        // Only this test's device is asserted on - the database may be shared.
+        assert!(list_devices(&db)
+            .await
+            .unwrap()
+            .iter()
+            .any(|d| d.id == device.id));
     }
 
     #[tokio::test]
     async fn device_merge_updates_flags_without_recreating_unknown_content() {
-        let db = memory_db().await;
+        let db = test_db().await;
         let device = register_device(&db, "test", None).await.unwrap();
         let todo_id = upsert_todo(
             &db,
@@ -180,10 +205,13 @@ mod tests {
 
     #[tokio::test]
     async fn account_flow_and_admin_summary() {
-        let db = memory_db().await;
-        let account = register_account(&db, "alice", "fake-hash").await.unwrap();
-        assert_eq!(account.id, 1);
-        let found = find_account_by_username(&db, "alice")
+        let db = test_db().await;
+        // Unique-per-run username: this suite may run against a shared
+        // PostgreSQL database that already holds an "alice".
+        let username = format!("alice-{}", Uuid::new_v4().simple());
+        let account = register_account(&db, &username, "fake-hash").await.unwrap();
+        assert!(account.id > 0);
+        let found = find_account_by_username(&db, &username)
             .await
             .unwrap()
             .unwrap();
@@ -196,17 +224,26 @@ mod tests {
         assert!(!device_owned_by(&db, &device.id, 999).await.unwrap());
 
         let summaries = list_accounts(&db).await.unwrap();
-        assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].device_count, 1);
+        let summary = summaries
+            .iter()
+            .find(|s| s.username == username)
+            .expect("newly created account listed");
+        assert_eq!(summary.device_count, 1);
 
         assert!(delete_account(&db, account.id).await.unwrap());
         assert!(!delete_account(&db, account.id).await.unwrap());
-        assert!(list_devices(&db).await.unwrap().is_empty());
+        // The cascade must have removed the account's device (not every
+        // device - the database may be shared).
+        assert!(!list_devices(&db)
+            .await
+            .unwrap()
+            .iter()
+            .any(|d| d.id == device.id));
     }
 
     #[tokio::test]
     async fn webhook_channel_delivers_unique_seq_and_idempotent_dedup() {
-        let db = memory_db().await;
+        let db = test_db().await;
         let device = register_device(&db, "dev", None).await.unwrap();
         let (channel, token) = create_channel(&db, &device.id, "webhook", "CI", None)
             .await
@@ -292,7 +329,7 @@ mod tests {
 
     #[tokio::test]
     async fn channel_ownership_and_rotate() {
-        let db = memory_db().await;
+        let db = test_db().await;
         let device = register_device(&db, "dev", None).await.unwrap();
         let (channel, _) = create_channel(&db, &device.id, "webhook", "CI", None)
             .await
@@ -348,7 +385,7 @@ mod tests {
 
     #[tokio::test]
     async fn inbox_capacity_is_capped() {
-        let db = memory_db().await;
+        let db = test_db().await;
         let device = register_device(&db, "dev", None).await.unwrap();
         let (channel, _) = create_channel(&db, &device.id, "webhook", "CI", None)
             .await
@@ -377,7 +414,7 @@ mod tests {
 
     #[tokio::test]
     async fn inbox_priority_roundtrips_and_drives_urgent_flag() {
-        let db = memory_db().await;
+        let db = test_db().await;
         let device = register_device(&db, "dev", None).await.unwrap();
         let (channel, _) = create_channel(&db, &device.id, "webhook", "CI", None)
             .await
@@ -429,7 +466,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_write_does_not_bump_device_version() {
-        let db = memory_db().await;
+        let db = test_db().await;
         let device = register_device(&db, "dev", None).await.unwrap();
         let before = find_device_by_token(&db, device.token.as_deref().unwrap())
             .await
