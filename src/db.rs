@@ -738,21 +738,11 @@ pub async fn upsert_alarm(
 }
 
 pub async fn delete_alarm(db: &Db, device_id: &str, id: u8) -> Result<()> {
-    sqlx::query(&db.adapt("DELETE FROM alarms WHERE device_id = ? AND local_id = ?"))
-        .bind(device_id)
-        .bind(id as i64)
-        .execute(&db.pool)
-        .await?;
-    bump_version(db, &db.pool, device_id).await?;
-    Ok(())
+    delete_local_id(db, "alarms", device_id, id).await
 }
 
 pub async fn clear_alarms(db: &Db, device_id: &str) -> Result<()> {
-    sqlx::query(&db.adapt("DELETE FROM alarms WHERE device_id = ?"))
-        .bind(device_id)
-        .execute(&db.pool)
-        .await?;
-    bump_version(db, &db.pool, device_id).await
+    clear_table(db, "alarms", device_id).await
 }
 
 pub async fn upsert_todo(
@@ -805,17 +795,34 @@ pub async fn upsert_todo(
 }
 
 pub async fn delete_todo(db: &Db, device_id: &str, id: u8) -> Result<()> {
-    sqlx::query(&db.adapt("DELETE FROM todos WHERE device_id = ? AND local_id = ?"))
+    delete_local_id(db, "todos", device_id, id).await
+}
+
+pub async fn clear_todos(db: &Db, device_id: &str) -> Result<()> {
+    clear_table(db, "todos", device_id).await
+}
+
+/// Deletes one `local_id`-keyed row for `device_id` and bumps the device's
+/// sync version. Shared by `delete_alarm`/`delete_todo` - `table` is always
+/// a hardcoded caller-supplied literal (`"alarms"`/`"todos"`), never
+/// request input, so building the query with `format!` here is safe (same
+/// pattern already used by `next_local_id`).
+async fn delete_local_id(db: &Db, table: &str, device_id: &str, id: u8) -> Result<()> {
+    let sql = db.adapt(&format!("DELETE FROM {table} WHERE device_id = ? AND local_id = ?"));
+    sqlx::query(&sql)
         .bind(device_id)
         .bind(id as i64)
         .execute(&db.pool)
         .await?;
-    bump_version(db, &db.pool, device_id).await?;
-    Ok(())
+    bump_version(db, &db.pool, device_id).await
 }
 
-pub async fn clear_todos(db: &Db, device_id: &str) -> Result<()> {
-    sqlx::query(&db.adapt("DELETE FROM todos WHERE device_id = ?"))
+/// Deletes every row for `device_id` from `table` and bumps the device's
+/// sync version. Shared by `clear_alarms`/`clear_todos` - see
+/// `delete_local_id` for why the `format!` here is safe.
+async fn clear_table(db: &Db, table: &str, device_id: &str) -> Result<()> {
+    let sql = db.adapt(&format!("DELETE FROM {table} WHERE device_id = ?"));
+    sqlx::query(&sql)
         .bind(device_id)
         .execute(&db.pool)
         .await?;
@@ -956,6 +963,12 @@ pub fn new_channel_token() -> String {
     format!("ipwh_{}", new_token())
 }
 
+/// Short prefix shown to clients so a webhook token can be recognized
+/// without ever re-displaying (or storing) the full secret.
+fn token_prefix(token: &str) -> String {
+    token.chars().take(12).collect()
+}
+
 /// Creates a channel for `device_id` and returns `(Channel, plaintext_token)`.
 /// `token` is `Some` only for webhook channels and is returned exactly once.
 /// `config` (CalDAV etc.) is stored encrypted by the caller if provided.
@@ -972,7 +985,7 @@ pub async fn create_channel(
         let token = new_channel_token();
         let hash = crate::auth::hash_password(&token)
             .map_err(|e| anyhow!("failed to hash channel token: {e}"))?;
-        let prefix = token.chars().take(12).collect::<String>();
+        let prefix = token_prefix(&token);
         (Some(hash), Some(prefix), Some(token))
     } else {
         (None, None, None)
@@ -1107,14 +1120,15 @@ pub async fn delete_channel(db: &Db, device_id: &str, channel_id: &str) -> Resul
     }
 }
 
-/// Rotates a webhook channel's token, returning the new plaintext. Rejects
-/// non-webhook channels. The old token stops working immediately because it
-/// hashed to a different value than the stored one.
+/// Rotates a webhook channel's token, returning the new plaintext and its
+/// display prefix. Rejects non-webhook channels. The old token stops
+/// working immediately because it hashed to a different value than the
+/// stored one.
 pub async fn rotate_channel_token(
     db: &Db,
     device_id: &str,
     channel_id: &str,
-) -> Result<Option<String>> {
+) -> Result<Option<(String, String)>> {
     let row = sqlx::query(&db.adapt("SELECT kind FROM channels WHERE device_id = ? AND id = ?"))
         .bind(device_id)
         .bind(channel_id)
@@ -1130,7 +1144,7 @@ pub async fn rotate_channel_token(
     let token = new_channel_token();
     let hash = crate::auth::hash_password(&token)
         .map_err(|e| anyhow!("failed to hash channel token: {e}"))?;
-    let prefix = token.chars().take(12).collect::<String>();
+    let prefix = token_prefix(&token);
     sqlx::query(&db.adapt(
         "UPDATE channels SET token_hash = ?, token_prefix = ?, updated_at = ? WHERE device_id = ? AND id = ?",
     ))
@@ -1141,7 +1155,7 @@ pub async fn rotate_channel_token(
     .bind(channel_id)
     .execute(&db.pool)
     .await?;
-    Ok(Some(token))
+    Ok(Some((token, prefix)))
 }
 
 /// Atomically allocates the next inbox `seq` for a device and writes the
@@ -1684,11 +1698,12 @@ mod tests {
             .is_none());
 
         // Rotate changes the token (verifiable via a changed hash check).
-        let new_token = rotate_channel_token(&db, &device.id, &channel.id)
+        let (new_token, new_prefix) = rotate_channel_token(&db, &device.id, &channel.id)
             .await
             .unwrap()
             .unwrap();
         assert!(new_token.starts_with("ipwh_"));
+        assert_eq!(new_prefix, new_token.chars().take(12).collect::<String>());
         assert_ne!(
             get_channel(&db, &device.id, &channel.id)
                 .await

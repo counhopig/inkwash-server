@@ -474,6 +474,12 @@ async fn build_sync_response(
 /// Max inbox items sent to the device in one sync response (hard capacity).
 const INBOX_LIMIT: usize = 20;
 
+/// Includes device identity so a cached ETag from an old/re-registered
+/// device can never suppress the first payload for a different device.
+fn sync_etag(device_id: &str, version: i64) -> String {
+    format!("\"d{device_id}-v{version}\"")
+}
+
 async fn device_sync(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let Some(token) = bearer_token(&headers) else {
         tracing::warn!("sync rejected: missing bearer token");
@@ -488,9 +494,7 @@ async fn device_sync(State(state): State<AppState>, headers: HeaderMap) -> Respo
         Err(err) => return internal_error(err),
     };
 
-    // Include device identity so a cached ETag from an old/re-registered
-    // device can never suppress the first payload for a different device.
-    let etag = format!("\"d{device_id}-v{version}\"");
+    let etag = sync_etag(&device_id, version);
     let if_none_match = headers
         .get(axum::http::header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok());
@@ -554,7 +558,7 @@ async fn device_push_sync(
         Ok(body) => Json(body),
         Err(resp) => return resp.into_response(),
     };
-    let etag = format!("\"d{device_id}-v{version}\"");
+    let etag = sync_etag(&device_id, version);
     tracing::info!(
         device_id,
         version,
@@ -943,8 +947,7 @@ async fn rotate_channel_token(
         return *resp;
     }
     match db::rotate_channel_token(&state.db, &device_id, &channel_id).await {
-        Ok(Some(token)) => {
-            let prefix = token.chars().take(12).collect::<String>();
+        Ok(Some((token, prefix))) => {
             Json(serde_json::json!({ "token": token, "token_prefix": prefix })).into_response()
         }
         Ok(None) => (StatusCode::NOT_FOUND, "channel not found or not a webhook").into_response(),
