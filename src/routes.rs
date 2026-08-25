@@ -20,6 +20,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use rust_embed::RustEmbed;
+use subtle::ConstantTimeEq;
 
 use crate::db::{self, Db};
 use crate::models::{
@@ -221,9 +222,9 @@ async fn logout_account(State(state): State<AppState>, headers: HeaderMap) -> Re
 /// Validates a stored session token so the console can confirm it's still
 /// logged in on load. Also answers for the admin token.
 async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    match auth_context(&headers, &state).await {
-        Ok(AuthContext::Admin) => Json(serde_json::json!({ "kind": "admin" })).into_response(),
-        Ok(AuthContext::Account(account_id)) => {
+    match authenticate(&headers, &state, None).await {
+        Ok(AuthSubject::Admin) => Json(serde_json::json!({ "kind": "admin" })).into_response(),
+        Ok(AuthSubject::Session { account_id }) => {
             match db::account_by_id(&state.db, account_id).await {
                 Ok(Some(account)) => Json(serde_json::json!({
                     "kind": "account",
@@ -235,6 +236,9 @@ async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
                 Err(err) => internal_error(err),
             }
         }
+        Ok(AuthSubject::Device { .. } | AuthSubject::Channel { .. }) => {
+            (StatusCode::UNAUTHORIZED, "invalid session").into_response()
+        }
         Err(resp) => resp.into_response(),
     }
 }
@@ -244,18 +248,23 @@ async fn change_password(
     headers: HeaderMap,
     Json(req): Json<ChangePasswordRequest>,
 ) -> Response {
-    let ctx = match auth_context(&headers, &state).await {
-        Ok(ctx) => ctx,
+    let subject = match authenticate(&headers, &state, None).await {
+        Ok(subject) => subject,
         Err(resp) => return resp.into_response(),
     };
-    let AuthContext::Account(account_id) = ctx else {
-        // The admin token is configured via env, not a password we can
-        // change - reject instead of pretending to succeed.
-        return (
-            StatusCode::BAD_REQUEST,
-            "admin token is set in server config",
-        )
-            .into_response();
+    let AuthSubject::Session { account_id } = subject else {
+        match subject {
+            // The admin token is configured via env, not a password we can
+            // change - reject instead of pretending to succeed.
+            AuthSubject::Admin => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "admin token is set in server config",
+                )
+                    .into_response();
+            }
+            _ => return (StatusCode::UNAUTHORIZED, "invalid session").into_response(),
+        }
     };
     let stored = match db::account_by_id(&state.db, account_id).await {
         Ok(Some(a)) => a,
@@ -319,58 +328,110 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .and_then(|v| v.strip_prefix("Bearer "))
 }
 
-/// Who is calling: the owner's `ADMIN_TOKEN` (full access), a console
-/// account session (`account_id`, scoped to that account's devices), or
-/// nobody (rejected with 401).
-#[derive(Clone, Copy)]
-enum AuthContext {
+/// Who is calling, resolved by the single `authenticate()` dispatch below.
+/// This is the one place all four credential kinds are recognized - before
+/// this existed, admin/session (`auth_context`), device (`/api/sync`'s bare
+/// token lookup) and channel webhook (inline `verify_password`) each had
+/// their own independent authorization path, so a new route category could
+/// easily have invented a fifth. Routes match on the variant they accept
+/// and reject everything else with 401/403 exactly as the old paths did.
+#[derive(Clone, Debug)]
+pub enum AuthSubject {
+    /// The owner's `ADMIN_TOKEN` (full access to every device).
     Admin,
-    Account(i64),
+    /// A console-account session token; scoped to the account's own devices.
+    Session { account_id: i64 },
+    /// A device sync token issued by `register_device`.
+    Device { device_id: String, version: i64 },
+    /// A webhook channel token, already verified against the channel named
+    /// in the request path (`authenticate` is given `Some(channel_id)`).
+    Channel { device_id: String },
 }
 
-async fn auth_context(
+/// Resolves the bearer credential in `headers` to an `AuthSubject`, trying
+/// the four credential kinds in order. `channel_id` is `Some` only on the
+/// webhook delivery route: a `ipwh_`-prefixed token can't be matched to a
+/// channel from the token alone (the hash is one-way), so the channel named
+/// in the request path carries the hash to verify against.
+///
+/// Error semantics match the old separate paths: anything unrecognized is a
+/// 401; callers that require a specific subject turn other subjects into
+/// the same 401/403 they produced before the unification.
+pub async fn authenticate(
     headers: &HeaderMap,
     state: &AppState,
-) -> Result<AuthContext, (StatusCode, &'static str)> {
+    channel_id: Option<&str>,
+) -> Result<AuthSubject, (StatusCode, &'static str)> {
     let Some(token) = bearer_token(headers) else {
         return Err((StatusCode::UNAUTHORIZED, "missing or invalid credentials"));
     };
-    if token == state.admin_token {
-        return Ok(AuthContext::Admin);
+    // Admin token: constant-time comparison so a wrong token's reject path
+    // doesn't finish measurably earlier than a right one's (T-014).
+    if bool::from(state.admin_token.as_bytes().ct_eq(token.as_bytes())) {
+        return Ok(AuthSubject::Admin);
     }
     match db::find_session(&state.db, token).await {
-        Ok(Some(account_id)) => Ok(AuthContext::Account(account_id)),
-        Ok(None) => Err((StatusCode::UNAUTHORIZED, "missing or invalid credentials")),
+        Ok(Some(account_id)) => return Ok(AuthSubject::Session { account_id }),
+        Ok(None) => {}
         Err(err) => {
             tracing::error!("{err:#}");
-            Err((StatusCode::INTERNAL_SERVER_ERROR, "storage error"))
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, "storage error"));
         }
     }
+    if let Some((device_id, version)) =
+        db::find_device_by_token(&state.db, token)
+            .await
+            .map_err(|err| {
+                tracing::error!("{err:#}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "storage error")
+            })?
+    {
+        return Ok(AuthSubject::Device { device_id, version });
+    }
+    if let Some(channel_id) = channel_id {
+        if let Some((device_id, token_hash)) = db::get_channel_for_delivery(&state.db, channel_id)
+            .await
+            .map_err(|err| {
+                tracing::error!("{err:#}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "storage error")
+            })?
+        {
+            if crate::auth::verify_password(token, &token_hash) {
+                return Ok(AuthSubject::Channel { device_id });
+            }
+        }
+    }
+    Err((StatusCode::UNAUTHORIZED, "missing or invalid credentials"))
 }
 
 /// Authenticates and, for account sessions, verifies the account owns
 /// `device_id`. The admin token may access any device. Returns the resolved
-/// context so the caller knows whether it is managing another account's
+/// subject so the caller knows whether it is managing another account's
 /// device (relevant for `register_device`, which must attach ownership).
 async fn require_device_access(
     headers: &HeaderMap,
     state: &AppState,
     device_id: &str,
-) -> Result<AuthContext, Box<Response>> {
-    let ctx = auth_context(headers, state)
+) -> Result<AuthSubject, Box<Response>> {
+    let subject = authenticate(headers, state, None)
         .await
         .map_err(|e| Box::new(e.into_response()))?;
-    match ctx {
-        AuthContext::Admin => Ok(ctx),
-        AuthContext::Account(account_id) => {
+    match subject {
+        AuthSubject::Admin => Ok(subject),
+        AuthSubject::Session { account_id } => {
             match db::device_owned_by(&state.db, device_id, account_id).await {
-                Ok(true) => Ok(ctx),
+                Ok(true) => Ok(subject),
                 Ok(false) => Err(Box::new(
                     (StatusCode::NOT_FOUND, "device not found").into_response(),
                 )),
                 Err(err) => Err(Box::new(internal_error(err))),
             }
         }
+        // A device or channel token is not a management credential - same
+        // 401 the old `auth_context` produced for them.
+        AuthSubject::Device { .. } | AuthSubject::Channel { .. } => Err(Box::new(
+            (StatusCode::UNAUTHORIZED, "missing or invalid credentials").into_response(),
+        )),
     }
 }
 
@@ -387,9 +448,12 @@ async fn require_admin_only(
     headers: &HeaderMap,
     state: &AppState,
 ) -> Result<(), (StatusCode, &'static str)> {
-    match auth_context(headers, state).await {
-        Ok(AuthContext::Admin) => Ok(()),
-        Ok(AuthContext::Account(_)) => Err((StatusCode::FORBIDDEN, "admin token required")),
+    match authenticate(headers, state, None).await {
+        Ok(AuthSubject::Admin) => Ok(()),
+        Ok(AuthSubject::Session { .. }) => Err((StatusCode::FORBIDDEN, "admin token required")),
+        Ok(AuthSubject::Device { .. } | AuthSubject::Channel { .. }) => {
+            Err((StatusCode::UNAUTHORIZED, "missing or invalid credentials"))
+        }
         Err(resp) => Err(resp),
     }
 }
@@ -481,17 +545,16 @@ fn sync_etag(device_id: &str, version: i64) -> String {
 }
 
 async fn device_sync(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(token) = bearer_token(&headers) else {
-        tracing::warn!("sync rejected: missing bearer token");
-        return (StatusCode::UNAUTHORIZED, "missing bearer token").into_response();
+    let subject = match authenticate(&headers, &state, None).await {
+        Ok(subject) => subject,
+        Err(resp) => return resp.into_response(),
     };
-    let (device_id, version) = match db::find_device_by_token(&state.db, token).await {
-        Ok(Some(v)) => v,
-        Ok(None) => {
-            tracing::warn!("sync rejected: unknown device token");
-            return (StatusCode::UNAUTHORIZED, "unknown device token").into_response();
-        }
-        Err(err) => return internal_error(err),
+    // Only a device sync token is accepted on this endpoint - admin, session
+    // and channel credentials get the same 401 they did from the old bare
+    // `find_device_by_token` lookup.
+    let AuthSubject::Device { device_id, version } = subject else {
+        tracing::warn!("sync rejected: non-device credentials");
+        return (StatusCode::UNAUTHORIZED, "unknown device token").into_response();
     };
 
     let etag = sync_etag(&device_id, version);
@@ -523,13 +586,13 @@ async fn device_push_sync(
     headers: HeaderMap,
     Json(req): Json<DeviceSyncRequest>,
 ) -> Response {
-    let Some(token) = bearer_token(&headers) else {
-        return (StatusCode::UNAUTHORIZED, "missing bearer token").into_response();
+    let subject = match authenticate(&headers, &state, None).await {
+        Ok(subject) => subject,
+        Err(resp) => return resp.into_response(),
     };
-    let device_id = match db::find_device_by_token(&state.db, token).await {
-        Ok(Some((id, _))) => id,
-        Ok(None) => return (StatusCode::UNAUTHORIZED, "unknown device token").into_response(),
-        Err(err) => return internal_error(err),
+    let AuthSubject::Device { device_id, .. } = subject else {
+        tracing::warn!("sync rejected: non-device credentials");
+        return (StatusCode::UNAUTHORIZED, "unknown device token").into_response();
     };
 
     // Lightweight poll: the device asks with `X-Inkwash-Poll: 1` to check
@@ -577,16 +640,19 @@ async fn register_device(
     headers: HeaderMap,
     Json(req): Json<RegisterDeviceRequest>,
 ) -> Response {
-    let ctx = match auth_context(&headers, &state).await {
-        Ok(ctx) => ctx,
+    let subject = match authenticate(&headers, &state, None).await {
+        Ok(subject) => subject,
         Err(resp) => return resp.into_response(),
     };
     if req.name.trim().is_empty() || req.name.chars().count() > 80 {
         return bad_request("device name must be 1..80 characters");
     }
-    let account_id = match ctx {
-        AuthContext::Admin => None,
-        AuthContext::Account(id) => Some(id),
+    let account_id = match subject {
+        AuthSubject::Admin => None,
+        AuthSubject::Session { account_id } => Some(account_id),
+        AuthSubject::Device { .. } | AuthSubject::Channel { .. } => {
+            return (StatusCode::UNAUTHORIZED, "missing or invalid credentials").into_response()
+        }
     };
     match db::register_device(&state.db, &req.name, account_id).await {
         Ok(device) => (StatusCode::CREATED, Json(device)).into_response(),
@@ -595,13 +661,18 @@ async fn register_device(
 }
 
 async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let ctx = match auth_context(&headers, &state).await {
-        Ok(ctx) => ctx,
+    let subject = match authenticate(&headers, &state, None).await {
+        Ok(subject) => subject,
         Err(resp) => return resp.into_response(),
     };
-    let devices = match ctx {
-        AuthContext::Admin => db::list_devices(&state.db).await,
-        AuthContext::Account(account_id) => db::list_account_devices(&state.db, account_id).await,
+    let devices = match subject {
+        AuthSubject::Admin => db::list_devices(&state.db).await,
+        AuthSubject::Session { account_id } => {
+            db::list_account_devices(&state.db, account_id).await
+        }
+        AuthSubject::Device { .. } | AuthSubject::Channel { .. } => {
+            return (StatusCode::UNAUTHORIZED, "missing or invalid credentials").into_response()
+        }
     };
     match devices {
         Ok(devices) => Json(devices).into_response(),
@@ -964,21 +1035,22 @@ async fn deliver_inbox(
     Path(channel_id): Path<String>,
     Json(req): Json<InboxCreateRequest>,
 ) -> Response {
-    // Query the channel by id first, then verify the token. Both wrong-token
-    // and unknown-channel end as 401/404 so channel existence isn't leaked.
-    let Some((device_id, token_hash)) =
-        (match db::get_channel_for_delivery(&state.db, &channel_id).await {
-            Ok(v) => v,
-            Err(err) => return internal_error(err),
-        })
-    else {
+    // Existence check first, then token verification, so wrong-token and
+    // unknown-channel end as 401/404 respectively and channel existence
+    // isn't leaked. The token is verified by `authenticate` against the
+    // hash of this path's channel (a channel token can't identify its own
+    // channel - the hash is one-way).
+    let Some((device_id, _)) = (match db::get_channel_for_delivery(&state.db, &channel_id).await {
+        Ok(v) => v,
+        Err(err) => return internal_error(err),
+    }) else {
         return (StatusCode::NOT_FOUND, "unknown channel").into_response();
     };
-    let Some(token) = bearer_token(&headers) else {
-        return (StatusCode::UNAUTHORIZED, "invalid channel token").into_response();
-    };
-    if !crate::auth::verify_password(token, &token_hash) {
-        return (StatusCode::UNAUTHORIZED, "invalid channel token").into_response();
+    match authenticate(&headers, &state, Some(&channel_id)).await {
+        Ok(AuthSubject::Channel {
+            device_id: verified,
+        }) if verified == device_id => {}
+        _ => return (StatusCode::UNAUTHORIZED, "invalid channel token").into_response(),
     }
     // Only enabled channels accept deliveries.
     let enabled = match db::get_channel(&state.db, &device_id, &channel_id).await {
@@ -1072,5 +1144,117 @@ async fn clear_inbox(
     match db::clear_read_inbox(&state.db, &device_id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => internal_error(err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    async fn test_state() -> AppState {
+        let db = db::open("sqlite::memory:", 1)
+            .await
+            .expect("open in-memory db");
+        AppState {
+            db,
+            admin_token: "admin-token-123".to_string(),
+        }
+    }
+
+    fn bearer(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        headers
+    }
+
+    #[tokio::test]
+    async fn authenticate_rejects_missing_and_wrong_tokens() {
+        let state = test_state().await;
+        // No Authorization header at all.
+        assert!(authenticate(&HeaderMap::new(), &state, None).await.is_err());
+        // A wrong admin token must still be rejected (constant-time compare).
+        let err = authenticate(&bearer("wrong-token"), &state, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn authenticate_resolves_all_four_subjects() {
+        let state = test_state().await;
+        // Admin token.
+        match authenticate(&bearer("admin-token-123"), &state, None)
+            .await
+            .unwrap()
+        {
+            AuthSubject::Admin => {}
+            other => panic!("expected Admin, got {other:?}"),
+        }
+        // Console session token.
+        let account = db::register_account(&state.db, "alice", "hash")
+            .await
+            .unwrap();
+        let session = db::create_session(&state.db, account.id).await.unwrap();
+        match authenticate(&bearer(&session), &state, None).await.unwrap() {
+            AuthSubject::Session { account_id } => assert_eq!(account_id, account.id),
+            other => panic!("expected Session, got {other:?}"),
+        }
+        // Device sync token.
+        let device = db::register_device(&state.db, "clock", None).await.unwrap();
+        match authenticate(&bearer(device.token.as_deref().unwrap()), &state, None)
+            .await
+            .unwrap()
+        {
+            AuthSubject::Device { device_id, .. } => assert_eq!(device_id, device.id),
+            other => panic!("expected Device, got {other:?}"),
+        }
+        // Channel webhook token, verified against the channel in the path.
+        let (channel, token) = db::create_channel(&state.db, &device.id, "webhook", "CI", None)
+            .await
+            .unwrap();
+        match authenticate(
+            &bearer(token.as_deref().unwrap()),
+            &state,
+            Some(&channel.id),
+        )
+        .await
+        .unwrap()
+        {
+            AuthSubject::Channel { device_id } => assert_eq!(device_id, device.id),
+            other => panic!("expected Channel, got {other:?}"),
+        }
+        // A session token resolves as a session even on the channel route;
+        // the webhook handler then rejects any non-Channel subject.
+        match authenticate(&bearer(&session), &state, Some(&channel.id))
+            .await
+            .unwrap()
+        {
+            AuthSubject::Session { .. } => {}
+            other => panic!("expected Session, got {other:?}"),
+        }
+        // A device token is not a management credential on device-scoped routes.
+        let headers = bearer(device.token.as_deref().unwrap());
+        assert!(require_device_access(&headers, &state, &device.id)
+            .await
+            .is_err());
+        // require_admin_only rejects sessions with 403 and devices with 401.
+        assert_eq!(
+            require_admin_only(&bearer(&session), &state)
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            require_admin_only(&bearer(device.token.as_deref().unwrap()), &state)
+                .await
+                .unwrap_err()
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
     }
 }

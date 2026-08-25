@@ -461,6 +461,24 @@ fn new_token() -> String {
 /// `list_devices` omits it, so losing it means re-registering. `account_id:
 /// None` creates an unowned device (only reachable with the `ADMIN_TOKEN`);
 /// `Some` ties the device to a console account.
+///
+/// ## Token storage decision (2026-08-25, T-015)
+/// Device and session tokens are stored **plaintext**, unlike webhook
+/// channel tokens (Argon2id-hashed in `create_channel`). Deliberate:
+/// - A device/session token is a 48-char CSPRNG string with ~288 bits of
+///   entropy - brute-forcing the stored value is not a realistic attack,
+///   unlike the user-chosen passwords those same tables otherwise hold.
+/// - Both are looked up with `WHERE token = ?` at every request. Hashing
+///   them would make lookup an all-rows scan (Argon2 is one-way; a hash
+///   can't index the table), costing far more than the plaintext compare
+///   saves - and the DB is already behind the same trust boundary that
+///   grants admin access to everything.
+/// - Tokens are per-device/per-session and revocable by deletion
+///   (`delete_device`/`delete_session`), so a leaked value is contained
+///   without a data migration.
+/// - Channel tokens are hashed instead because they are meant to be pasted
+///   into third-party tools and integrations, where the "personal server"
+///   trust boundary does not hold the same way.
 pub async fn register_device(db: &Db, name: &str, account_id: Option<i64>) -> Result<Device> {
     let token = new_token();
     let now = now_unix();
@@ -808,7 +826,9 @@ pub async fn clear_todos(db: &Db, device_id: &str) -> Result<()> {
 /// request input, so building the query with `format!` here is safe (same
 /// pattern already used by `next_local_id`).
 async fn delete_local_id(db: &Db, table: &str, device_id: &str, id: u8) -> Result<()> {
-    let sql = db.adapt(&format!("DELETE FROM {table} WHERE device_id = ? AND local_id = ?"));
+    let sql = db.adapt(&format!(
+        "DELETE FROM {table} WHERE device_id = ? AND local_id = ?"
+    ));
     sqlx::query(&sql)
         .bind(device_id)
         .bind(id as i64)
@@ -822,10 +842,7 @@ async fn delete_local_id(db: &Db, table: &str, device_id: &str, id: u8) -> Resul
 /// `delete_local_id` for why the `format!` here is safe.
 async fn clear_table(db: &Db, table: &str, device_id: &str) -> Result<()> {
     let sql = db.adapt(&format!("DELETE FROM {table} WHERE device_id = ?"));
-    sqlx::query(&sql)
-        .bind(device_id)
-        .execute(&db.pool)
-        .await?;
+    sqlx::query(&sql).bind(device_id).execute(&db.pool).await?;
     bump_version(db, &db.pool, device_id).await
 }
 
@@ -923,6 +940,10 @@ pub async fn delete_account(db: &Db, account_id: i64) -> Result<bool> {
 }
 
 /// Creates a session for `account_id` and returns its bearer token.
+/// Stored plaintext by design - see `register_device`'s "Token storage
+/// decision" comment (T-015): sessions are 48-char CSPRNG, revocable via
+/// `delete_session`, and hashing would turn the `WHERE token = ?` lookup
+/// into an all-rows scan.
 pub async fn create_session(db: &Db, account_id: i64) -> Result<String> {
     let token = new_token();
     sqlx::query(&db.adapt("INSERT INTO sessions (token, account_id, created_at) VALUES (?, ?, ?)"))
@@ -1813,7 +1834,9 @@ mod tests {
         assert!(has_unread_high_inbox(&db, &device.id).await.unwrap());
 
         // Marking the urgent one read clears the flag.
-        mark_inbox_read(&db, &device.id, &[urgent.id]).await.unwrap();
+        mark_inbox_read(&db, &device.id, &[urgent.id])
+            .await
+            .unwrap();
         assert!(!has_unread_high_inbox(&db, &device.id).await.unwrap());
     }
 }

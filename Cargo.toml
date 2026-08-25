@@ -19,6 +19,7 @@ rust-embed = { version = "8.12.0", features = ["mime-guess"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlx = { version = "0.8", features = ["runtime-tokio", "any", "sqlite", "postgres"] }
+subtle = "2"
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.5", features = ["trace", "cors"] }
 tracing = "0.1"
