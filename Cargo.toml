@@ -24,4 +24,9 @@ tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.5", features = ["trace", "cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# TypeScript bindings for the admin console (admin-ui/src/lib/generated/) are
+# derived from the wire DTOs in src/models.rs via #[derive(TS)]; `cargo test`
+# regenerates them (see models.rs). serde-compat (default feature) keeps serde
+# rename/skip attributes in sync with the JSON shape.
+ts-rs = "12"
 uuid = { version = "1", features = ["v4"] }

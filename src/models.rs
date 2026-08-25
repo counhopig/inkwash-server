@@ -17,8 +17,17 @@
 //! way the re-exports above are, so keeping them as this crate's own types
 //! costs nothing and preserves the `skip_serializing_if` compactness the
 //! shared `SyncResponse` in `inkwash-logic` doesn't need to care about.
+//!
+//! Admin-ui TypeScript bindings: server-local DTOs carry
+//! `#[derive(TS)] #[ts(export, export_to = "../admin-ui/src/lib/generated/")]`
+//! so `cargo test` regenerates one `.ts` file per type there (see
+//! admin-ui/src/lib/types.ts for which types stay handwritten because they
+//! embed `inkwash-logic` shapes). u64/i64 would default to TS `bigint`;
+//! every value actually sent (rowids, unix timestamps) fits JS's exact-
+//! number range, so such fields are pinned to `number`.
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 pub use inkwash_logic::alarm_schedule::{Repeat, StoredAlarm as Alarm};
 pub use inkwash_logic::inbox_item::{InboxItem, InboxKind, Priority};
@@ -74,7 +83,8 @@ pub struct DeviceTodoState {
     pub importance: Option<Importance>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
+#[ts(export, export_to = "../admin-ui/src/lib/generated/")]
 pub struct Device {
     /// UUID (v4) - opaque string, not an enumerable integer, so ids can't
     /// be guessed or iterated by an attacker who steals one url.
@@ -83,6 +93,7 @@ pub struct Device {
     /// Only ever returned once, at registration time - not readable again
     /// afterward (see `db::register_device`'s doc comment).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub token: Option<String>,
 }
 
@@ -146,12 +157,19 @@ pub struct ChangePasswordRequest {
 }
 
 /// Admin-only view of an account (never exposes the password hash).
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
+#[ts(export, export_to = "../admin-ui/src/lib/generated/")]
 pub struct AccountSummary {
+    /// Rowid/timestamp counters are pinned to TS `number` (not `bigint`) -
+    /// see the module doc on admin-ui bindings.
+    #[ts(type = "number")]
     pub id: i64,
     pub username: String,
+    #[ts(type = "number")]
     pub created_at: i64,
+    #[ts(type = "number")]
     pub device_count: i64,
+    #[ts(type = "number")]
     pub session_count: i64,
 }
 
@@ -165,20 +183,26 @@ pub struct AdminResetPasswordRequest {
 /// A configured external source (webhook / CalDAV) bound to one device.
 /// This is the admin-facing view; it never contains the plaintext token or
 /// decrypted CalDAV credentials.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../admin-ui/src/lib/generated/")]
 pub struct Channel {
     pub id: String,
     pub device_id: String,
-    /// `"webhook"` or `"caldav_basic"` (Phase 1 implements webhook).
+    /// `"webhook"` or `"caldav_basic"` (Phase 1 implements webhook). Stored
+    /// as a plain string and validated on write, so the generated TS type is
+    /// `string`; the UI narrows it locally where it needs the union.
     pub kind: String,
     pub name: String,
     pub enabled: bool,
     /// Short prefix of the webhook token for human identification (never a
     /// credential). Empty for non-webhook channels.
     pub token_prefix: String,
+    #[ts(type = "number | null")]
     pub last_sync_at: Option<i64>,
     pub last_sync_error: Option<String>,
+    #[ts(type = "number")]
     pub created_at: i64,
+    #[ts(type = "number")]
     pub updated_at: i64,
 }
 
@@ -201,12 +225,15 @@ pub struct UpdateChannelRequest {
 
 /// Response to `POST .../channels` for a webhook channel: the plaintext
 /// token is returned exactly once here.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
+#[ts(export, export_to = "../admin-ui/src/lib/generated/")]
 pub struct ChannelCreated {
     pub channel: Channel,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub delivery_url: Option<String>,
 }
 
