@@ -3,9 +3,11 @@
 //! accounts/sessions, channels/inbox, alarms/todos); the cross-aggregate
 //! sync merge lives in `sync.rs`.
 //!
-//! Data SQL uses sqlx's cross-dialect `?` placeholders and `i64` for every
-//! integer so one SQL body works on both backends - `Db::adapt()` rewrites
-//! `?` to `$N` for Postgres at runtime.
+//! Placeholder-bearing statements are explicitly maintained as SQLite/PostgreSQL
+//! string pairs picked by `Db::sql`; statements without placeholders are
+//! dialect-neutral and passed to sqlx as-is. Every integer is bound as `i64`
+//! on both backends. Keep each pair's tables, columns and bind order identical -
+//! only the placeholder style (`?` vs `$1, $2, …`) may differ.
 
 use anyhow::{anyhow, Result};
 use rand::distributions::Alphanumeric;
@@ -62,7 +64,10 @@ pub async fn register_device(db: &Db, name: &str, account_id: Option<i64>) -> Re
     let token = new_token();
     let now = now_unix();
     let id = Uuid::new_v4().to_string();
-    sqlx::query(&db.adapt("INSERT INTO devices (id, name, token, version, created_at, account_id) VALUES (?, ?, ?, 0, ?, ?)"))
+    sqlx::query(db.sql(
+            "INSERT INTO devices (id, name, token, version, created_at, account_id) VALUES (?, ?, ?, 0, ?, ?)",
+            "INSERT INTO devices (id, name, token, version, created_at, account_id) VALUES ($1, $2, $3, 0, $4, $5)"
+        ))
     .bind(&id)
     .bind(name)
     .bind(&token)
@@ -78,9 +83,12 @@ pub async fn register_device(db: &Db, name: &str, account_id: Option<i64>) -> Re
 }
 
 pub async fn list_devices(db: &Db) -> Result<Vec<Device>> {
-    let rows = sqlx::query(&db.adapt("SELECT id, name FROM devices ORDER BY name"))
-        .fetch_all(&db.pool)
-        .await?;
+    let rows = sqlx::query(db.sql(
+        "SELECT id, name FROM devices ORDER BY name",
+        "SELECT id, name FROM devices ORDER BY name",
+    ))
+    .fetch_all(&db.pool)
+    .await?;
     rows.into_iter()
         .map(|r| {
             Ok(Device {
@@ -95,11 +103,13 @@ pub async fn list_devices(db: &Db) -> Result<Vec<Device>> {
 /// Devices owned by one console account (for `GET /api/devices` when the
 /// caller is an account session rather than the admin token).
 pub async fn list_account_devices(db: &Db, account_id: i64) -> Result<Vec<Device>> {
-    let rows =
-        sqlx::query(&db.adapt("SELECT id, name FROM devices WHERE account_id = ? ORDER BY name"))
-            .bind(account_id)
-            .fetch_all(&db.pool)
-            .await?;
+    let rows = sqlx::query(db.sql(
+        "SELECT id, name FROM devices WHERE account_id = ? ORDER BY name",
+        "SELECT id, name FROM devices WHERE account_id = $1 ORDER BY name",
+    ))
+    .bind(account_id)
+    .fetch_all(&db.pool)
+    .await?;
     rows.into_iter()
         .map(|r| {
             Ok(Device {
@@ -113,9 +123,10 @@ pub async fn list_account_devices(db: &Db, account_id: i64) -> Result<Vec<Device
 
 /// Whether `device_id` exists and is owned by `account_id`.
 pub async fn device_owned_by(db: &Db, device_id: &str, account_id: i64) -> Result<bool> {
-    let count: i64 = sqlx::query_scalar(
-        &db.adapt("SELECT COUNT(*) FROM devices WHERE id = ? AND account_id = ?"),
-    )
+    let count: i64 = sqlx::query_scalar(db.sql(
+        "SELECT COUNT(*) FROM devices WHERE id = ? AND account_id = ?",
+        "SELECT COUNT(*) FROM devices WHERE id = $1 AND account_id = $2",
+    ))
     .bind(device_id)
     .bind(account_id)
     .fetch_one(&db.pool)
@@ -124,10 +135,13 @@ pub async fn device_owned_by(db: &Db, device_id: &str, account_id: i64) -> Resul
 }
 
 pub async fn delete_device(db: &Db, device_id: &str) -> Result<()> {
-    sqlx::query(&db.adapt("DELETE FROM devices WHERE id = ?"))
-        .bind(device_id)
-        .execute(&db.pool)
-        .await?;
+    sqlx::query(db.sql(
+        "DELETE FROM devices WHERE id = ?",
+        "DELETE FROM devices WHERE id = $1",
+    ))
+    .bind(device_id)
+    .execute(&db.pool)
+    .await?;
     Ok(())
 }
 
@@ -135,10 +149,13 @@ pub async fn delete_device(db: &Db, device_id: &str) -> Result<()> {
 /// Plaintext lookup by design - see `register_device`'s "Token storage
 /// decision" comment (T-015).
 pub async fn find_device_by_token(db: &Db, token: &str) -> Result<Option<(String, i64)>> {
-    let row = sqlx::query(&db.adapt("SELECT id, version FROM devices WHERE token = ?"))
-        .bind(token)
-        .fetch_optional(&db.pool)
-        .await?;
+    let row = sqlx::query(db.sql(
+        "SELECT id, version FROM devices WHERE token = ?",
+        "SELECT id, version FROM devices WHERE token = $1",
+    ))
+    .bind(token)
+    .fetch_optional(&db.pool)
+    .await?;
     row.map(|r| -> Result<(String, i64)> { Ok((r.try_get(0)?, r.try_get(1)?)) })
         .transpose()
 }
@@ -150,10 +167,13 @@ pub async fn bump_version<'e, E>(db: &Db, executor: E, device_id: &str) -> Resul
 where
     E: Executor<'e, Database = Any>,
 {
-    sqlx::query(&db.adapt("UPDATE devices SET version = version + 1 WHERE id = ?"))
-        .bind(device_id)
-        .execute(executor)
-        .await?;
+    sqlx::query(db.sql(
+        "UPDATE devices SET version = version + 1 WHERE id = ?",
+        "UPDATE devices SET version = version + 1 WHERE id = $1",
+    ))
+    .bind(device_id)
+    .execute(executor)
+    .await?;
     Ok(())
 }
 
@@ -193,8 +213,12 @@ pub async fn list_alarms(db: &Db, device_id: &str) -> Result<Vec<Alarm>> {
 }
 
 pub async fn list_todos(db: &Db, device_id: &str) -> Result<Vec<Todo>> {
-    let rows = sqlx::query(&db.adapt("SELECT local_id, text, done, importance, due_year, due_month, due_day, repeat_kind, repeat_days
-         FROM todos WHERE device_id = ? ORDER BY local_id"))
+    let rows = sqlx::query(db.sql(
+            "SELECT local_id, text, done, importance, due_year, due_month, due_day, repeat_kind, repeat_days
+         FROM todos WHERE device_id = ? ORDER BY local_id",
+            "SELECT local_id, text, done, importance, due_year, due_month, due_day, repeat_kind, repeat_days
+         FROM todos WHERE device_id = $1 ORDER BY local_id"
+        ))
     .bind(device_id)
     .fetch_all(&db.pool)
     .await?;
@@ -237,9 +261,11 @@ async fn next_local_id<'e, E>(db: &Db, executor: E, table: &str, device_id: &str
 where
     E: Executor<'e, Database = Any>,
 {
-    let sql = db.adapt(&format!(
-        "SELECT MAX(local_id) FROM {table} WHERE device_id = ?"
-    ));
+    let sql = if db.postgres {
+        format!("SELECT MAX(local_id) FROM {table} WHERE device_id = $1")
+    } else {
+        format!("SELECT MAX(local_id) FROM {table} WHERE device_id = ?")
+    };
     let max: Option<i64> = sqlx::query_scalar(&sql)
         .bind(device_id)
         .fetch_one(executor)
@@ -265,13 +291,22 @@ pub async fn upsert_alarm(
     };
     let (repeat_kind, once_year, once_month, once_day, repeat_days) =
         repeat_to_columns(&req.repeat);
-    sqlx::query(&db.adapt("INSERT INTO alarms (device_id, local_id, hour, minute, repeat_kind, once_year, once_month, once_day, repeat_days, enabled, label)
+    sqlx::query(db.sql(
+            "INSERT INTO alarms (device_id, local_id, hour, minute, repeat_kind, once_year, once_month, once_day, repeat_days, enabled, label)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(device_id, local_id) DO UPDATE SET
             hour=excluded.hour, minute=excluded.minute, repeat_kind=excluded.repeat_kind,
             once_year=excluded.once_year, once_month=excluded.once_month, once_day=excluded.once_day,
             repeat_days=excluded.repeat_days,
-            enabled=excluded.enabled, label=excluded.label"))
+            enabled=excluded.enabled, label=excluded.label",
+            "INSERT INTO alarms (device_id, local_id, hour, minute, repeat_kind, once_year, once_month, once_day, repeat_days, enabled, label)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         ON CONFLICT(device_id, local_id) DO UPDATE SET
+            hour=excluded.hour, minute=excluded.minute, repeat_kind=excluded.repeat_kind,
+            once_year=excluded.once_year, once_month=excluded.once_month, once_day=excluded.once_day,
+            repeat_days=excluded.repeat_days,
+            enabled=excluded.enabled, label=excluded.label"
+        ))
     .bind(device_id)
     .bind(id as i64)
     .bind(req.hour as i64)
@@ -326,12 +361,20 @@ pub async fn upsert_todo(
         Some(Repeat::Monthly { days }) => (Some("monthly"), repeat_days_json_opt(days)),
         Some(Repeat::Once { .. }) | None => (None, None),
     };
-    sqlx::query(&db.adapt("INSERT INTO todos (device_id, local_id, text, done, importance, due_year, due_month, due_day, repeat_kind, repeat_days)
+    sqlx::query(db.sql(
+            "INSERT INTO todos (device_id, local_id, text, done, importance, due_year, due_month, due_day, repeat_kind, repeat_days)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(device_id, local_id) DO UPDATE SET
             text=excluded.text, done=excluded.done, importance=excluded.importance,
             due_year=excluded.due_year, due_month=excluded.due_month, due_day=excluded.due_day,
-            repeat_kind=excluded.repeat_kind, repeat_days=excluded.repeat_days"))
+            repeat_kind=excluded.repeat_kind, repeat_days=excluded.repeat_days",
+            "INSERT INTO todos (device_id, local_id, text, done, importance, due_year, due_month, due_day, repeat_kind, repeat_days)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         ON CONFLICT(device_id, local_id) DO UPDATE SET
+            text=excluded.text, done=excluded.done, importance=excluded.importance,
+            due_year=excluded.due_year, due_month=excluded.due_month, due_day=excluded.due_day,
+            repeat_kind=excluded.repeat_kind, repeat_days=excluded.repeat_days"
+        ))
     .bind(device_id)
     .bind(id as i64)
     .bind(&req.text)
@@ -364,9 +407,11 @@ pub async fn clear_todos(db: &Db, device_id: &str) -> Result<()> {
 /// `format!` here is safe (same pattern already used by `next_local_id`).
 async fn delete_local_id(db: &Db, table: &str, device_id: &str, id: u8) -> Result<()> {
     let mut tx = db.pool.begin().await?;
-    let sql = db.adapt(&format!(
-        "DELETE FROM {table} WHERE device_id = ? AND local_id = ?"
-    ));
+    let sql = if db.postgres {
+        format!("DELETE FROM {table} WHERE device_id = $1 AND local_id = $2")
+    } else {
+        format!("DELETE FROM {table} WHERE device_id = ? AND local_id = ?")
+    };
     sqlx::query(&sql)
         .bind(device_id)
         .bind(id as i64)
@@ -382,7 +427,11 @@ async fn delete_local_id(db: &Db, table: &str, device_id: &str, id: u8) -> Resul
 /// `clear_todos` - see `delete_local_id` for why the `format!` here is safe.
 async fn clear_table(db: &Db, table: &str, device_id: &str) -> Result<()> {
     let mut tx = db.pool.begin().await?;
-    let sql = db.adapt(&format!("DELETE FROM {table} WHERE device_id = ?"));
+    let sql = if db.postgres {
+        format!("DELETE FROM {table} WHERE device_id = $1")
+    } else {
+        format!("DELETE FROM {table} WHERE device_id = ?")
+    };
     sqlx::query(&sql).bind(device_id).execute(&mut *tx).await?;
     bump_version(db, &mut *tx, device_id).await?;
     tx.commit().await?;
@@ -392,9 +441,10 @@ async fn clear_table(db: &Db, table: &str, device_id: &str) -> Result<()> {
 // --- Console accounts & sessions ---------------------------------------
 
 pub async fn register_account(db: &Db, username: &str, password_hash: &str) -> Result<Account> {
-    let id: i64 = sqlx::query_scalar(&db.adapt(
-        "INSERT INTO accounts (username, password_hash, created_at) VALUES (?, ?, ?) RETURNING id",
-    ))
+    let id: i64 = sqlx::query_scalar(db.sql(
+            "INSERT INTO accounts (username, password_hash, created_at) VALUES (?, ?, ?) RETURNING id",
+            "INSERT INTO accounts (username, password_hash, created_at) VALUES ($1, $2, $3) RETURNING id"
+        ))
     .bind(username)
     .bind(password_hash)
     .bind(now_unix())
@@ -409,10 +459,13 @@ pub async fn register_account(db: &Db, username: &str, password_hash: &str) -> R
 
 /// Returns `(account_id, password_hash)` for a username, if it exists.
 pub async fn find_account_by_username(db: &Db, username: &str) -> Result<Option<(i64, String)>> {
-    let row = sqlx::query(&db.adapt("SELECT id, password_hash FROM accounts WHERE username = ?"))
-        .bind(username)
-        .fetch_optional(&db.pool)
-        .await?;
+    let row = sqlx::query(db.sql(
+        "SELECT id, password_hash FROM accounts WHERE username = ?",
+        "SELECT id, password_hash FROM accounts WHERE username = $1",
+    ))
+    .bind(username)
+    .fetch_optional(&db.pool)
+    .await?;
     row.map(|r| -> Result<(i64, String)> {
         Ok((r.try_get::<i64, _>(0)?, r.try_get::<String, _>(1)?))
     })
@@ -420,10 +473,13 @@ pub async fn find_account_by_username(db: &Db, username: &str) -> Result<Option<
 }
 
 pub async fn account_by_id(db: &Db, account_id: i64) -> Result<Option<Account>> {
-    let row = sqlx::query(&db.adapt("SELECT id, username, created_at FROM accounts WHERE id = ?"))
-        .bind(account_id)
-        .fetch_optional(&db.pool)
-        .await?;
+    let row = sqlx::query(db.sql(
+        "SELECT id, username, created_at FROM accounts WHERE id = ?",
+        "SELECT id, username, created_at FROM accounts WHERE id = $1",
+    ))
+    .bind(account_id)
+    .fetch_optional(&db.pool)
+    .await?;
     row.map(|r| -> Result<Account> {
         Ok(Account {
             id: r.try_get(0)?,
@@ -435,17 +491,24 @@ pub async fn account_by_id(db: &Db, account_id: i64) -> Result<Option<Account>> 
 }
 
 pub async fn update_account_password(db: &Db, account_id: i64, password_hash: &str) -> Result<()> {
-    sqlx::query(&db.adapt("UPDATE accounts SET password_hash = ? WHERE id = ?"))
-        .bind(password_hash)
-        .bind(account_id)
-        .execute(&db.pool)
-        .await?;
+    sqlx::query(db.sql(
+        "UPDATE accounts SET password_hash = ? WHERE id = ?",
+        "UPDATE accounts SET password_hash = $1 WHERE id = $2",
+    ))
+    .bind(password_hash)
+    .bind(account_id)
+    .execute(&db.pool)
+    .await?;
     Ok(())
 }
 
 /// Admin-only listing of every account with its device/session counts.
 pub async fn list_accounts(db: &Db) -> Result<Vec<AccountSummary>> {
-    let rows = sqlx::query(&db.adapt(
+    let rows = sqlx::query(db.sql(
+        "SELECT a.id, a.username, a.created_at,
+                (SELECT COUNT(*) FROM devices d WHERE d.account_id = a.id),
+                (SELECT COUNT(*) FROM sessions s WHERE s.account_id = a.id)
+         FROM accounts a ORDER BY a.username",
         "SELECT a.id, a.username, a.created_at,
                 (SELECT COUNT(*) FROM devices d WHERE d.account_id = a.id),
                 (SELECT COUNT(*) FROM sessions s WHERE s.account_id = a.id)
@@ -468,10 +531,13 @@ pub async fn list_accounts(db: &Db) -> Result<Vec<AccountSummary>> {
 
 /// Deletes an account; `false` when no such account exists.
 pub async fn delete_account(db: &Db, account_id: i64) -> Result<bool> {
-    let res = sqlx::query(&db.adapt("DELETE FROM accounts WHERE id = ?"))
-        .bind(account_id)
-        .execute(&db.pool)
-        .await?;
+    let res = sqlx::query(db.sql(
+        "DELETE FROM accounts WHERE id = ?",
+        "DELETE FROM accounts WHERE id = $1",
+    ))
+    .bind(account_id)
+    .execute(&db.pool)
+    .await?;
     Ok(res.rows_affected() > 0)
 }
 
@@ -482,29 +548,38 @@ pub async fn delete_account(db: &Db, account_id: i64) -> Result<bool> {
 /// into an all-rows scan.
 pub async fn create_session(db: &Db, account_id: i64) -> Result<String> {
     let token = new_token();
-    sqlx::query(&db.adapt("INSERT INTO sessions (token, account_id, created_at) VALUES (?, ?, ?)"))
-        .bind(&token)
-        .bind(account_id)
-        .bind(now_unix())
-        .execute(&db.pool)
-        .await?;
+    sqlx::query(db.sql(
+        "INSERT INTO sessions (token, account_id, created_at) VALUES (?, ?, ?)",
+        "INSERT INTO sessions (token, account_id, created_at) VALUES ($1, $2, $3)",
+    ))
+    .bind(&token)
+    .bind(account_id)
+    .bind(now_unix())
+    .execute(&db.pool)
+    .await?;
     Ok(token)
 }
 
 /// Maps a session token to its `account_id`, if valid.
 pub async fn find_session(db: &Db, token: &str) -> Result<Option<i64>> {
-    let row = sqlx::query(&db.adapt("SELECT account_id FROM sessions WHERE token = ?"))
-        .bind(token)
-        .fetch_optional(&db.pool)
-        .await?;
+    let row = sqlx::query(db.sql(
+        "SELECT account_id FROM sessions WHERE token = ?",
+        "SELECT account_id FROM sessions WHERE token = $1",
+    ))
+    .bind(token)
+    .fetch_optional(&db.pool)
+    .await?;
     Ok(row.map(|r| r.try_get(0)).transpose()?)
 }
 
 pub async fn delete_session(db: &Db, token: &str) -> Result<()> {
-    sqlx::query(&db.adapt("DELETE FROM sessions WHERE token = ?"))
-        .bind(token)
-        .execute(&db.pool)
-        .await?;
+    sqlx::query(db.sql(
+        "DELETE FROM sessions WHERE token = ?",
+        "DELETE FROM sessions WHERE token = $1",
+    ))
+    .bind(token)
+    .execute(&db.pool)
+    .await?;
     Ok(())
 }
 
@@ -549,10 +624,12 @@ pub async fn create_channel(
         (None, None, None)
     };
     let mut tx = db.pool.begin().await?;
-    sqlx::query(&db.adapt(
-        "INSERT INTO channels (id, device_id, kind, name, enabled, token_hash, token_prefix, config_encrypted, config_version, created_at, updated_at)
+    sqlx::query(db.sql(
+            "INSERT INTO channels (id, device_id, kind, name, enabled, token_hash, token_prefix, config_encrypted, config_version, created_at, updated_at)
          VALUES (?, ?, ?, ?, 1, ?, ?, ?, 1, ?, ?)",
-    ))
+            "INSERT INTO channels (id, device_id, kind, name, enabled, token_hash, token_prefix, config_encrypted, config_version, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 1, $5, $6, $7, 1, $8, $9)"
+        ))
     .bind(&id)
     .bind(device_id)
     .bind(kind)
@@ -597,10 +674,12 @@ fn channel_from_row(row: sqlx::any::AnyRow) -> Result<Channel> {
 }
 
 pub async fn list_channels(db: &Db, device_id: &str) -> Result<Vec<Channel>> {
-    let rows = sqlx::query(&db.adapt(
-        "SELECT id, device_id, kind, name, enabled, token_prefix, last_sync_at, last_sync_error, created_at, updated_at
+    let rows = sqlx::query(db.sql(
+            "SELECT id, device_id, kind, name, enabled, token_prefix, last_sync_at, last_sync_error, created_at, updated_at
          FROM channels WHERE device_id = ? ORDER BY created_at",
-    ))
+            "SELECT id, device_id, kind, name, enabled, token_prefix, last_sync_at, last_sync_error, created_at, updated_at
+         FROM channels WHERE device_id = $1 ORDER BY created_at"
+        ))
     .bind(device_id)
     .fetch_all(&db.pool)
     .await?;
@@ -608,10 +687,12 @@ pub async fn list_channels(db: &Db, device_id: &str) -> Result<Vec<Channel>> {
 }
 
 pub async fn get_channel(db: &Db, device_id: &str, channel_id: &str) -> Result<Option<Channel>> {
-    let row = sqlx::query(&db.adapt(
-        "SELECT id, device_id, kind, name, enabled, token_prefix, last_sync_at, last_sync_error, created_at, updated_at
+    let row = sqlx::query(db.sql(
+            "SELECT id, device_id, kind, name, enabled, token_prefix, last_sync_at, last_sync_error, created_at, updated_at
          FROM channels WHERE device_id = ? AND id = ?",
-    ))
+            "SELECT id, device_id, kind, name, enabled, token_prefix, last_sync_at, last_sync_error, created_at, updated_at
+         FROM channels WHERE device_id = $1 AND id = $2"
+        ))
     .bind(device_id)
     .bind(channel_id)
     .fetch_optional(&db.pool)
@@ -627,10 +708,13 @@ pub async fn get_channel_for_delivery(
     db: &Db,
     channel_id: &str,
 ) -> Result<Option<(String, String)>> {
-    let row = sqlx::query(&db.adapt("SELECT device_id, token_hash FROM channels WHERE id = ?"))
-        .bind(channel_id)
-        .fetch_optional(&db.pool)
-        .await?;
+    let row = sqlx::query(db.sql(
+        "SELECT device_id, token_hash FROM channels WHERE id = ?",
+        "SELECT device_id, token_hash FROM channels WHERE id = $1",
+    ))
+    .bind(channel_id)
+    .fetch_optional(&db.pool)
+    .await?;
     row.map(|r| -> Result<(String, String)> {
         let hash: String = r
             .try_get::<Option<String>, _>(1)?
@@ -648,10 +732,12 @@ pub async fn update_channel(
     enabled: Option<bool>,
 ) -> Result<bool> {
     let mut tx = db.pool.begin().await?;
-    let res = sqlx::query(&db.adapt(
-        "UPDATE channels SET name = COALESCE(?, name), enabled = COALESCE(?, enabled), updated_at = ?
+    let res = sqlx::query(db.sql(
+            "UPDATE channels SET name = COALESCE(?, name), enabled = COALESCE(?, enabled), updated_at = ?
          WHERE device_id = ? AND id = ?",
-    ))
+            "UPDATE channels SET name = COALESCE($1, name), enabled = COALESCE($2, enabled), updated_at = $3
+         WHERE device_id = $4 AND id = $5"
+        ))
     .bind(name)
     .bind(enabled.map(|b| b as i64))
     .bind(now_unix())
@@ -669,11 +755,14 @@ pub async fn update_channel(
 
 pub async fn delete_channel(db: &Db, device_id: &str, channel_id: &str) -> Result<bool> {
     let mut tx = db.pool.begin().await?;
-    let res = sqlx::query(&db.adapt("DELETE FROM channels WHERE device_id = ? AND id = ?"))
-        .bind(device_id)
-        .bind(channel_id)
-        .execute(&mut *tx)
-        .await?;
+    let res = sqlx::query(db.sql(
+        "DELETE FROM channels WHERE device_id = ? AND id = ?",
+        "DELETE FROM channels WHERE device_id = $1 AND id = $2",
+    ))
+    .bind(device_id)
+    .bind(channel_id)
+    .execute(&mut *tx)
+    .await?;
     let changed = res.rows_affected() > 0;
     if changed {
         bump_version(db, &mut *tx, device_id).await?;
@@ -691,11 +780,14 @@ pub async fn rotate_channel_token(
     device_id: &str,
     channel_id: &str,
 ) -> Result<Option<(String, String)>> {
-    let row = sqlx::query(&db.adapt("SELECT kind FROM channels WHERE device_id = ? AND id = ?"))
-        .bind(device_id)
-        .bind(channel_id)
-        .fetch_optional(&db.pool)
-        .await?;
+    let row = sqlx::query(db.sql(
+        "SELECT kind FROM channels WHERE device_id = ? AND id = ?",
+        "SELECT kind FROM channels WHERE device_id = $1 AND id = $2",
+    ))
+    .bind(device_id)
+    .bind(channel_id)
+    .fetch_optional(&db.pool)
+    .await?;
     let Some(row) = row else {
         return Ok(None);
     };
@@ -707,9 +799,10 @@ pub async fn rotate_channel_token(
     let hash = crate::auth::hash_password(&token)
         .map_err(|e| anyhow!("failed to hash channel token: {e}"))?;
     let prefix = token_prefix(&token);
-    sqlx::query(&db.adapt(
-        "UPDATE channels SET token_hash = ?, token_prefix = ?, updated_at = ? WHERE device_id = ? AND id = ?",
-    ))
+    sqlx::query(db.sql(
+            "UPDATE channels SET token_hash = ?, token_prefix = ?, updated_at = ? WHERE device_id = ? AND id = ?",
+            "UPDATE channels SET token_hash = $1, token_prefix = $2, updated_at = $3 WHERE device_id = $4 AND id = $5"
+        ))
     .bind(&hash)
     .bind(&prefix)
     .bind(now_unix())
@@ -740,45 +833,48 @@ async fn insert_inbox_with_seq(
     // Ensure a sequence row exists, then claim the next value. The row is
     // seeded at 0 and incremented before read, so the first allocated seq
     // is 1.
-    sqlx::query(&db.adapt(
+    sqlx::query(db.sql(
         "INSERT INTO device_sequences (device_id, next_inbox_seq) VALUES (?, 0)
+         ON CONFLICT(device_id) DO NOTHING",
+        "INSERT INTO device_sequences (device_id, next_inbox_seq) VALUES ($1, 0)
          ON CONFLICT(device_id) DO NOTHING",
     ))
     .bind(device_id)
     .execute(&mut **tx)
     .await?;
+    // Postgres can hand back the new value in one statement via RETURNING;
+    // SQLite (sqlx 0.8) cannot, so the increment and read are two steps.
     let seq: i64 = if db.postgres {
-        let row = sqlx::query(&db.adapt(
+        sqlx::query_scalar(
             "UPDATE device_sequences SET next_inbox_seq = next_inbox_seq + 1
-             WHERE device_id = ? RETURNING next_inbox_seq",
-        ))
+             WHERE device_id = $1 RETURNING next_inbox_seq",
+        )
         .bind(device_id)
         .fetch_one(&mut **tx)
-        .await?;
-        row.try_get(0)?
+        .await?
     } else {
-        let row = sqlx::query(&db.adapt(
+        let row = sqlx::query(
             "UPDATE device_sequences SET next_inbox_seq = next_inbox_seq + 1
              WHERE device_id = ?",
-        ))
+        )
         .bind(device_id)
         .execute(&mut **tx)
         .await?;
         if row.rows_affected() == 0 {
             return Err(anyhow!("failed to allocate inbox sequence"));
         }
-        sqlx::query_scalar(
-            &db.adapt("SELECT next_inbox_seq FROM device_sequences WHERE device_id = ?"),
-        )
-        .bind(device_id)
-        .fetch_one(&mut **tx)
-        .await?
+        sqlx::query_scalar("SELECT next_inbox_seq FROM device_sequences WHERE device_id = ?")
+            .bind(device_id)
+            .fetch_one(&mut **tx)
+            .await?
     };
     let now = now_unix();
-    sqlx::query(&db.adapt(
-        "INSERT INTO inbox (id, device_id, channel_id, seq, kind, priority, title, body, when_epoch, source_ref, read, created_at, updated_at)
+    sqlx::query(db.sql(
+            "INSERT INTO inbox (id, device_id, channel_id, seq, kind, priority, title, body, when_epoch, source_ref, read, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
-    ))
+            "INSERT INTO inbox (id, device_id, channel_id, seq, kind, priority, title, body, when_epoch, source_ref, read, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, $11, $12)"
+        ))
     .bind(id)
     .bind(device_id)
     .bind(channel_id)
@@ -813,9 +909,10 @@ pub async fn deliver_inbox(
 ) -> Result<(u64, bool)> {
     let mut tx = db.pool.begin().await?;
     if let Some(ref_ref) = source_ref {
-        let existing: Option<i64> = sqlx::query_scalar(
-            &db.adapt("SELECT seq FROM inbox WHERE channel_id = ? AND source_ref = ?"),
-        )
+        let existing: Option<i64> = sqlx::query_scalar(db.sql(
+            "SELECT seq FROM inbox WHERE channel_id = ? AND source_ref = ?",
+            "SELECT seq FROM inbox WHERE channel_id = $1 AND source_ref = $2",
+        ))
         .bind(channel_id)
         .bind(ref_ref)
         .fetch_optional(&mut *tx)
@@ -838,14 +935,18 @@ pub async fn deliver_inbox(
 /// Returns the device's inbox for the sync response: unread first, then by
 /// `seq DESC`, capped at `limit`. `truncated` is true when more rows exist.
 pub async fn list_inbox(db: &Db, device_id: &str, limit: usize) -> Result<(Vec<InboxItem>, bool)> {
-    let total: i64 =
-        sqlx::query_scalar(&db.adapt("SELECT COUNT(*) FROM inbox WHERE device_id = ?"))
-            .bind(device_id)
-            .fetch_one(&db.pool)
-            .await?;
-    let rows = sqlx::query(&db.adapt(
+    let total: i64 = sqlx::query_scalar(db.sql(
+        "SELECT COUNT(*) FROM inbox WHERE device_id = ?",
+        "SELECT COUNT(*) FROM inbox WHERE device_id = $1",
+    ))
+    .bind(device_id)
+    .fetch_one(&db.pool)
+    .await?;
+    let rows = sqlx::query(db.sql(
         "SELECT seq, kind, priority, title, body, when_epoch, read FROM inbox
          WHERE device_id = ? ORDER BY read ASC, seq DESC LIMIT ?",
+        "SELECT seq, kind, priority, title, body, when_epoch, read FROM inbox
+         WHERE device_id = $1 ORDER BY read ASC, seq DESC LIMIT $2",
     ))
     .bind(device_id)
     .bind(limit as i64)
@@ -881,8 +982,9 @@ pub async fn mark_inbox_read(db: &Db, device_id: &str, seqs: &[u64]) -> Result<V
     let mut tx = db.pool.begin().await?;
     let mut acked = Vec::new();
     for seq in seqs {
-        let res = sqlx::query(&db.adapt(
+        let res = sqlx::query(db.sql(
             "UPDATE inbox SET read = 1, updated_at = ? WHERE device_id = ? AND seq = ? AND read = 0",
+            "UPDATE inbox SET read = 1, updated_at = $1 WHERE device_id = $2 AND seq = $3 AND read = 0"
         ))
         .bind(now_unix())
         .bind(device_id)
@@ -903,11 +1005,14 @@ pub async fn mark_inbox_read(db: &Db, device_id: &str, seqs: &[u64]) -> Result<V
 /// Management/debug helper: delete a single inbox item for a device.
 pub async fn delete_inbox_item(db: &Db, device_id: &str, seq: u64) -> Result<bool> {
     let mut tx = db.pool.begin().await?;
-    let res = sqlx::query(&db.adapt("DELETE FROM inbox WHERE device_id = ? AND seq = ?"))
-        .bind(device_id)
-        .bind(seq as i64)
-        .execute(&mut *tx)
-        .await?;
+    let res = sqlx::query(db.sql(
+        "DELETE FROM inbox WHERE device_id = ? AND seq = ?",
+        "DELETE FROM inbox WHERE device_id = $1 AND seq = $2",
+    ))
+    .bind(device_id)
+    .bind(seq as i64)
+    .execute(&mut *tx)
+    .await?;
     let changed = res.rows_affected() > 0;
     if changed {
         bump_version(db, &mut *tx, device_id).await?;
@@ -919,10 +1024,13 @@ pub async fn delete_inbox_item(db: &Db, device_id: &str, seq: u64) -> Result<boo
 /// Management/debug helper: clear read inbox history for a device.
 pub async fn clear_read_inbox(db: &Db, device_id: &str) -> Result<()> {
     let mut tx = db.pool.begin().await?;
-    let res = sqlx::query(&db.adapt("DELETE FROM inbox WHERE device_id = ? AND read = 1"))
-        .bind(device_id)
-        .execute(&mut *tx)
-        .await?;
+    let res = sqlx::query(db.sql(
+        "DELETE FROM inbox WHERE device_id = ? AND read = 1",
+        "DELETE FROM inbox WHERE device_id = $1 AND read = 1",
+    ))
+    .bind(device_id)
+    .execute(&mut *tx)
+    .await?;
     if res.rows_affected() > 0 {
         bump_version(db, &mut *tx, device_id).await?;
     }
@@ -934,8 +1042,9 @@ pub async fn clear_read_inbox(db: &Db, device_id: &str) -> Result<()> {
 /// long-poll wait so the server can return immediately when an urgent message
 /// arrives, without the device polling on a timer.
 pub async fn has_unread_high_inbox(db: &Db, device_id: &str) -> Result<bool> {
-    let count: i64 = sqlx::query_scalar(&db.adapt(
+    let count: i64 = sqlx::query_scalar(db.sql(
         "SELECT COUNT(*) FROM inbox WHERE device_id = ? AND read = 0 AND priority = 'high'",
+        "SELECT COUNT(*) FROM inbox WHERE device_id = $1 AND read = 0 AND priority = 'high'",
     ))
     .bind(device_id)
     .fetch_one(&db.pool)

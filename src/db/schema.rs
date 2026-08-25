@@ -105,11 +105,13 @@ type LegacyAlarmRow = (
 /// `INTEGER PRIMARY KEY AUTOINCREMENT` and `alarms`/`todos` referenced it with
 /// an INTEGER `device_id`. Personal-scale data (a handful of devices) is
 /// copied over row by row; the device auth token is preserved, so devices
-/// keep syncing without re-registering. Only meaningful for SQLite.
+/// keep syncing without re-registering. Only called on the SQLite path from
+/// `open()` (the `pragma_table_info` checks below are SQLite-only), so its
+/// statements are plain SQLite SQL with no dialect selection.
 async fn migrate_legacy_integer_ids(db: &Db) -> Result<()> {
-    let legacy: i64 = sqlx::query_scalar(&db.adapt(
+    let legacy: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('devices') WHERE name = 'id' AND type = 'INTEGER'",
-    ))
+    )
     .fetch_one(&db.pool)
     .await?;
     if legacy == 0 {
@@ -119,10 +121,9 @@ async fn migrate_legacy_integer_ids(db: &Db) -> Result<()> {
 
     let mut tx = db.pool.begin().await?;
     let devices: Vec<(i64, String, String, i64, i64)> = {
-        let rows =
-            sqlx::query(&db.adapt("SELECT id, name, token, version, created_at FROM devices"))
-                .fetch_all(&mut *tx)
-                .await?;
+        let rows = sqlx::query("SELECT id, name, token, version, created_at FROM devices")
+            .fetch_all(&mut *tx)
+            .await?;
         rows.into_iter()
             .map(|r| {
                 Ok((
@@ -136,7 +137,7 @@ async fn migrate_legacy_integer_ids(db: &Db) -> Result<()> {
             .collect::<Result<Vec<_>>>()?
     };
     let alarms: Vec<LegacyAlarmRow> = {
-        let rows = sqlx::query(&db.adapt("SELECT device_id, local_id, hour, minute, repeat_kind, once_year, once_month, once_day, enabled, label FROM alarms"))
+        let rows = sqlx::query("SELECT device_id, local_id, hour, minute, repeat_kind, once_year, once_month, once_day, enabled, label FROM alarms")
         .fetch_all(&mut *tx)
         .await?;
         rows.into_iter()
@@ -157,7 +158,7 @@ async fn migrate_legacy_integer_ids(db: &Db) -> Result<()> {
             .collect::<Result<Vec<_>>>()?
     };
     let todos: Vec<(i64, i64, String, i64)> = {
-        let rows = sqlx::query(&db.adapt("SELECT device_id, local_id, text, done FROM todos"))
+        let rows = sqlx::query("SELECT device_id, local_id, text, done FROM todos")
             .fetch_all(&mut *tx)
             .await?;
         rows.into_iter()
@@ -175,9 +176,9 @@ async fn migrate_legacy_integer_ids(db: &Db) -> Result<()> {
     for (old_id, name, token, version, created_at) in &devices {
         let new_id = Uuid::new_v4().to_string();
         id_map.insert(*old_id, new_id.clone());
-        sqlx::query(&db.adapt(
+        sqlx::query(
             "INSERT INTO devices (id, name, token, version, created_at) VALUES (?, ?, ?, ?, ?)",
-        ))
+        )
         .bind(&new_id)
         .bind(name)
         .bind(token)
@@ -202,8 +203,8 @@ async fn migrate_legacy_integer_ids(db: &Db) -> Result<()> {
         let Some(new_device_id) = id_map.get(device_id) else {
             continue;
         };
-        sqlx::query(&db.adapt("INSERT INTO alarms (device_id, local_id, hour, minute, repeat_kind, once_year, once_month, once_day, enabled, label)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"))
+        sqlx::query("INSERT INTO alarms (device_id, local_id, hour, minute, repeat_kind, once_year, once_month, once_day, enabled, label)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         .bind(new_device_id)
         .bind(local_id)
         .bind(hour)
@@ -221,15 +222,13 @@ async fn migrate_legacy_integer_ids(db: &Db) -> Result<()> {
         let Some(new_device_id) = id_map.get(device_id) else {
             continue;
         };
-        sqlx::query(
-            &db.adapt("INSERT INTO todos (device_id, local_id, text, done) VALUES (?, ?, ?, ?)"),
-        )
-        .bind(new_device_id)
-        .bind(local_id)
-        .bind(text)
-        .bind(done)
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query("INSERT INTO todos (device_id, local_id, text, done) VALUES (?, ?, ?, ?)")
+            .bind(new_device_id)
+            .bind(local_id)
+            .bind(text)
+            .bind(done)
+            .execute(&mut *tx)
+            .await?;
     }
     tx.commit().await?;
     tracing::info!("migrated {} devices to UUID ids", devices.len());
@@ -243,6 +242,9 @@ async fn migrate_legacy_integer_ids(db: &Db) -> Result<()> {
 /// one propagates loudly instead of being silently ignored. On fresh
 /// databases 0001_init.sql already declares every column, so this is a
 /// no-op there - it only ever fires on pre-migration-era SQLite files.
+/// Like `migrate_legacy_integer_ids`, this only runs on the SQLite path, so
+/// its statements are plain SQLite SQL (`pragma_table_info`) with no dialect
+/// selection.
 async fn backfill_missing_columns(db: &Db) -> Result<()> {
     // (table, column, ADD COLUMN clause); column names are hardcoded, never
     // request input.
@@ -258,9 +260,9 @@ async fn backfill_missing_columns(db: &Db) -> Result<()> {
         ("inbox", "priority", "TEXT NOT NULL DEFAULT 'normal'"),
     ];
     for (table, column, ddl) in candidates {
-        let exists: i64 = sqlx::query_scalar(&db.adapt(&format!(
+        let exists: i64 = sqlx::query_scalar(&format!(
             "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = '{column}'"
-        )))
+        ))
         .fetch_one(&db.pool)
         .await?;
         if exists > 0 {

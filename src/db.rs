@@ -9,10 +9,13 @@
 //!   alarms/todos (re-exported below so callers keep using `db::` paths)
 //! - [`sync`] - `merge_device_state` (device-uploaded flag merging)
 //!
-//! Data SQL uses sqlx's cross-dialect `?` placeholders and `i64` for every
-//! integer so one SQL body works on both backends; `Db::adapt()` rewrites
-//! `?` to `$N` for Postgres at runtime. A small connection pool (default
-//! max 2) replaces the old single `Arc<Mutex<Connection>>`.
+//! Data SQL exists in explicitly maintained dual-dialect form: every
+//! placeholder-bearing statement carries a SQLite (`?`) and a PostgreSQL
+//! (`$1, $2, …`) variant, picked once per call by [`Db::sql`] from the
+//! backend flag - no runtime rewriting (sqlx 0.8's Postgres driver does not
+//! translate `?` itself). Every integer is bound as `i64` on both backends.
+//! A small connection pool (default max 2) replaces the old single
+//! `Arc<Mutex<Connection>>`.
 
 use sqlx::AnyPool;
 
@@ -24,10 +27,10 @@ pub use queries::*;
 pub use schema::open;
 pub use sync::*;
 
-/// Wraps the sqlx `Any` pool plus the backend flag. Data SQL is written with
-/// `?` placeholders (SQLite-native); `adapt()` rewrites them to Postgres'
-/// `$1, $2, …` form at runtime, since sqlx 0.8's Postgres driver does not
-/// translate `?` itself.
+/// Wraps the sqlx `Any` pool plus the backend flag. Placeholder-bearing SQL
+/// is maintained as explicit SQLite/PostgreSQL string pairs selected by
+/// [`Db::sql`]; dialect-neutral statements (no placeholders) are passed to
+/// sqlx as-is.
 #[derive(Clone)]
 pub struct Db {
     pool: AnyPool,
@@ -46,23 +49,6 @@ impl Db {
         } else {
             sqlite
         }
-    }
-
-    fn adapt(&self, sql: &str) -> String {
-        if !self.postgres {
-            return sql.to_string();
-        }
-        let mut out = String::with_capacity(sql.len() + 8);
-        let mut n = 0;
-        for c in sql.chars() {
-            if c == '?' {
-                n += 1;
-                out.push_str(&format!("${n}"));
-            } else {
-                out.push(c);
-            }
-        }
-        out
     }
 }
 
@@ -495,5 +481,144 @@ mod tests {
             .unwrap()
             .1;
         assert_eq!(after, before, "version must not advance on a failed write");
+    }
+    #[tokio::test]
+    async fn alarm_todo_delete_and_account_updates() {
+        let db = test_db().await;
+        let username = format!("carol-{}", Uuid::new_v4().simple());
+        let account = register_account(&db, &username, "hash-1").await.unwrap();
+
+        // account_by_id / update_account_password roundtrip.
+        let fetched = account_by_id(&db, account.id).await.unwrap().unwrap();
+        assert_eq!(fetched.username, username);
+        update_account_password(&db, account.id, "hash-2")
+            .await
+            .unwrap();
+        let (_, password_hash) = find_account_by_username(&db, &username)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(password_hash, "hash-2");
+
+        // delete_alarm / delete_todo remove exactly their row.
+        let device = register_device(&db, "dev", None).await.unwrap();
+        let alarm_id = upsert_alarm(
+            &db,
+            &device.id,
+            None,
+            &UpsertAlarmRequest {
+                hour: 6,
+                minute: 45,
+                repeat: Repeat::Daily,
+                enabled: true,
+                label: "a".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        delete_alarm(&db, &device.id, alarm_id).await.unwrap();
+        assert!(list_alarms(&db, &device.id).await.unwrap().is_empty());
+
+        let todo_id = upsert_todo(
+            &db,
+            &device.id,
+            None,
+            &UpsertTodoRequest {
+                text: "t".to_string(),
+                done: false,
+                importance: Importance::Low,
+                due_date: None,
+                repeat: None,
+            },
+        )
+        .await
+        .unwrap();
+        delete_todo(&db, &device.id, todo_id).await.unwrap();
+        assert!(list_todos(&db, &device.id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_lifecycle() {
+        let db = test_db().await;
+        let username = format!("dave-{}", Uuid::new_v4().simple());
+        let account = register_account(&db, &username, "h").await.unwrap();
+        let token = create_session(&db, account.id).await.unwrap();
+        assert_eq!(find_session(&db, &token).await.unwrap(), Some(account.id));
+        delete_session(&db, &token).await.unwrap();
+        assert_eq!(find_session(&db, &token).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn channel_update_delivery_and_inbox_management() {
+        let db = test_db().await;
+        let device = register_device(&db, "dev", None).await.unwrap();
+        let (channel, token) = create_channel(&db, &device.id, "webhook", "old", None)
+            .await
+            .unwrap();
+
+        // list_channels scopes to the device; get_channel_for_delivery is
+        // unscoped and hands back the stored hash for token verification.
+        let listed = list_channels(&db, &device.id).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "old");
+        let (delivery_device, hash) = get_channel_for_delivery(&db, &channel.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivery_device, device.id);
+        assert!(crate::auth::verify_password(&token.unwrap(), &hash));
+
+        // update_channel merges only the provided fields.
+        assert!(
+            update_channel(&db, &device.id, &channel.id, Some("new"), Some(false))
+                .await
+                .unwrap()
+        );
+        let updated = get_channel(&db, &device.id, &channel.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.name, "new");
+        assert!(!updated.enabled);
+
+        // delete_inbox_item removes one seq; clear_read_inbox drops read ones.
+        let (seq1, _) = deliver_inbox(
+            &db,
+            &device.id,
+            &channel.id,
+            "info",
+            "normal",
+            "x",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let (seq2, _) = deliver_inbox(
+            &db,
+            &device.id,
+            &channel.id,
+            "info",
+            "normal",
+            "y",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        mark_inbox_read(&db, &device.id, &[seq1]).await.unwrap();
+        assert!(delete_inbox_item(&db, &device.id, seq2).await.unwrap());
+        clear_read_inbox(&db, &device.id).await.unwrap();
+        let (items, _) = list_inbox(&db, &device.id, 20).await.unwrap();
+        assert!(items.is_empty());
+
+        // delete_device cascades: its channels disappear with it.
+        delete_device(&db, &device.id).await.unwrap();
+        assert!(get_channel(&db, &device.id, &channel.id)
+            .await
+            .unwrap()
+            .is_none());
     }
 }
