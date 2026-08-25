@@ -8,6 +8,14 @@ anyhow = "1"
 argon2 = "0.5"
 axum = { version = "0.7", features = ["json"] }
 dotenvy = "0.15"
+# The Alarm/Todo/Repeat/InboxItem wire types (models.rs) are re-exports of
+# this crate's definitions rather than a hand-duplicated copy - see its
+# doc comments in ../inkwash/logic/src/. Pinned to a specific commit for
+# reproducible builds. TODO: switch `git` to
+# `https://github.com/counhopig/inkwash-firmware` once that commit is
+# pushed - a `file://` path only resolves on a machine that has ../inkwash
+# checked out.
+inkwash-logic = { git = "file:///Users/tomzhu/Documents/workspace/inkwash-workspace/inkwash", rev = "e96e0e78cfb64f589dc396fe3833c31af93f5c5c" }
 rand = "0.8"
 rust-embed = { version = "8.12.0", features = ["mime-guess"] }
 serde = { version = "1", features = ["derive"] }

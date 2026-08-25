@@ -1,153 +1,28 @@
 //! Wire types shared with the firmware's sync response (see
-//! `inkwash/docs/sync-api.md`). Field names/shapes here must match
-//! `rust-firmware/src/alarms.rs`'s `StoredAlarm`/`Repeat` and
-//! `rust-firmware/src/todos.rs`'s `Todo` exactly, since the firmware
-//! deserializes this JSON directly into those types with no adapter layer.
+//! `inkwash/docs/sync-api.md`).
+//!
+//! `Repeat`/`Alarm`/`Importance`/`TodoDue`/`Todo`/`InboxKind`/`Priority`/
+//! `InboxItem` are re-exports of `inkwash-logic`'s definitions (see the
+//! `inkwash-logic` dependency in `Cargo.toml`) rather than a hand-copied
+//! shape that could drift from the firmware's own - the firmware
+//! deserializes this JSON directly into those same Rust types with no
+//! adapter layer, so this crate and `rust-firmware` now literally share
+//! one definition instead of two independently-maintained ones that
+//! happened to agree. `Alarm` is `StoredAlarm` under its server-side name
+//! so every existing `models::Alarm` call site keeps working unchanged.
+//!
+//! Everything below that line is server-only - HTTP request/response DTOs
+//! whose JSON shape happens to match what the firmware expects, but that
+//! are never the literal same Rust value crossing a process boundary the
+//! way the re-exports above are, so keeping them as this crate's own types
+//! costs nothing and preserves the `skip_serializing_if` compactness the
+//! shared `SyncResponse` in `inkwash-logic` doesn't need to care about.
 
 use serde::{Deserialize, Serialize};
 
-/// Externally-tagged to match the firmware's plain `serde` derive on
-/// `enum Repeat { Daily, Weekly{..}, Monthly{..}, Once{..} }`: `Daily`
-/// serializes as the bare string `"Daily"`, the rest as `{"Weekly": {...}}`
-/// etc. Weekdays are 0=Sunday..6=Saturday; month days are 1..=31.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub enum Repeat {
-    Daily,
-    Weekly { days: Vec<u8> },
-    Monthly { days: Vec<u8> },
-    Once { year: u16, month: u8, day: u8 },
-}
-
-impl Repeat {
-    /// Stable discriminator used as the SQLite `repeat_kind` column.
-    pub const fn kind(&self) -> &'static str {
-        match self {
-            Repeat::Daily => "daily",
-            Repeat::Weekly { .. } => "weekly",
-            Repeat::Monthly { .. } => "monthly",
-            Repeat::Once { .. } => "once",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Alarm {
-    pub id: u8,
-    pub hour: u8,
-    pub minute: u8,
-    pub repeat: Repeat,
-    pub enabled: bool,
-    pub label: String,
-}
-
-/// Todo importance, serialized snake_case (`"low"`/`"medium"`/`"high"`) to
-/// match the firmware's `todos::Importance`. `Medium` is the default so
-/// records created before importance existed stay comparable.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum Importance {
-    Low,
-    #[default]
-    Medium,
-    High,
-}
-
-impl Importance {
-    /// Stable string used as the SQLite column value (`low`/`medium`/`high`).
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Importance::Low => "low",
-            Importance::Medium => "medium",
-            Importance::High => "high",
-        }
-    }
-}
-
-/// Full due date of a todo. The `year` field defaults to 0 for records
-/// synced before it existed; such todos have no concrete date and simply
-/// don't mark the device calendar or remind until re-edited.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TodoDue {
-    #[serde(default)]
-    pub year: u16,
-    pub month: u8,
-    pub day: u8,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Todo {
-    pub id: u8,
-    pub text: String,
-    pub done: bool,
-    #[serde(default)]
-    pub importance: Importance,
-    /// Single due date (used when `repeat` is `None`).
-    #[serde(default)]
-    pub due_date: Option<TodoDue>,
-    /// Recurrence schedule; when set, the todo is due on every date the
-    /// schedule covers instead of just `due_date`.
-    #[serde(default)]
-    pub repeat: Option<Repeat>,
-}
-
-/// Inbox notification kind, serialized snake_case to match the firmware's
-/// `InboxKind` (`"alert"`/`"event"`/`"info"`).
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum InboxKind {
-    Alert,
-    Event,
-    Info,
-}
-
-impl From<&str> for InboxKind {
-    fn from(s: &str) -> Self {
-        match s {
-            "alert" => InboxKind::Alert,
-            "event" => InboxKind::Event,
-            _ => InboxKind::Info,
-        }
-    }
-}
-
-/// Inbox notification priority, serialized snake_case to match the
-/// firmware's `Priority`. `High` drives on-device urgent behavior: the
-/// firmware shows a full-screen reminder with an insistent tone as soon as
-/// the message arrives on the next sync. `Normal` is the default.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum Priority {
-    #[default]
-    Normal,
-    High,
-}
-
-impl From<&str> for Priority {
-    fn from(s: &str) -> Self {
-        match s {
-            "high" => Priority::High,
-            _ => Priority::Normal,
-        }
-    }
-}
-
-/// A single inbox notification as seen by the device over the sync wire.
-/// `id` is the device-visible stable `seq` (u64); the server's internal
-/// UUID id is never sent to the device.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct InboxItem {
-    pub id: u64,
-    pub kind: InboxKind,
-    #[serde(default)]
-    pub priority: Priority,
-    pub title: String,
-    #[serde(default)]
-    pub body: String,
-    #[serde(default)]
-    pub when: Option<i64>,
-    #[serde(default)]
-    pub read: bool,
-}
+pub use inkwash_logic::alarm_schedule::{Repeat, StoredAlarm as Alarm};
+pub use inkwash_logic::inbox_item::{InboxItem, InboxKind, Priority};
+pub use inkwash_logic::todo::{Importance, Todo, TodoDue};
 
 /// Body of a successful (HTTP 200) `GET /api/sync` response - see
 /// `inkwash/docs/sync-api.md`.

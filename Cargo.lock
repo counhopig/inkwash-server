@@ -795,6 +795,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "inkwash-logic"
+version = "0.1.0"
+source = "git+file:///Users/tomzhu/Documents/workspace/inkwash-workspace/inkwash?rev=e96e0e78cfb64f589dc396fe3833c31af93f5c5c#e96e0e78cfb64f589dc396fe3833c31af93f5c5c"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "inkwash-server"
 version = "0.4.0"
 dependencies = [
@@ -802,6 +811,7 @@ dependencies = [
  "argon2",
  "axum",
  "dotenvy",
+ "inkwash-logic",
  "rand",
  "rust-embed",
  "serde",
