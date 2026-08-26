@@ -337,7 +337,7 @@ watch(() => props.device.id, loadContent);
       <div class="detail-title">
         <span class="ctx-mark" aria-hidden="true">▸</span>
         Editing <strong>{{ device.name }}</strong>
-        <span class="meta">· changes reach the device on its next sync</span>
+        <span class="meta"> · changes reach the device on its next sync</span>
       </div>
       <button
         class="danger"
@@ -356,8 +356,8 @@ watch(() => props.device.id, loadContent);
           <span class="count">{{ alarms.length }}</span>
         </div>
         <div class="row">
-          <label>Hour<input v-model.number="alarmHour" type="number" min="0" max="23" style="width: 85px" :disabled="ui.isBusy('add-alarm')" /></label>
-          <label>Minute<input v-model.number="alarmMinute" type="number" min="0" max="59" style="width: 85px" :disabled="ui.isBusy('add-alarm')" /></label>
+          <label>Hour<input v-model.number="alarmHour" type="number" min="0" max="23" :disabled="ui.isBusy('add-alarm')" /></label>
+          <label>Minute<input v-model.number="alarmMinute" type="number" min="0" max="59" :disabled="ui.isBusy('add-alarm')" /></label>
           <label class="grow">Label<input v-model="alarmLabel" placeholder="Wake up" :disabled="ui.isBusy('add-alarm')" /></label>
           <button class="primary" type="submit" :disabled="ui.isBusy('add-alarm')">
             {{ ui.isBusy("add-alarm") ? "Adding…" : "Add" }}
@@ -373,7 +373,7 @@ watch(() => props.device.id, loadContent);
             </select>
           </label>
           <label v-if="alarmRepeatKind === 'Weekly' || alarmRepeatKind === 'Monthly'">Days (comma-sep)
-            <input v-model="alarmRepeatDays" :placeholder="alarmRepeatKind === 'Weekly' ? '0,2,4 (0=Sun)' : '1,15'" style="width: 130px" />
+            <input v-model="alarmRepeatDays" :placeholder="alarmRepeatKind === 'Weekly' ? '0,2,4 (0=Sun)' : '1,15'" />
           </label>
           <label v-if="alarmRepeatKind === 'Once'">Date<input v-model="alarmOnceDate" type="date" /></label>
         </div>
@@ -422,7 +422,7 @@ watch(() => props.device.id, loadContent);
             <option value="Weekly">Weekly</option>
             <option value="Monthly">Monthly</option>
           </select>
-          <input v-if="todoRepeatKind === 'Weekly' || todoRepeatKind === 'Monthly'" v-model="todoRepeatDays" :placeholder="todoRepeatKind === 'Weekly' ? '0,2,4' : '1,15'" style="width: 70px" />
+          <input v-if="todoRepeatKind === 'Weekly' || todoRepeatKind === 'Monthly'" v-model="todoRepeatDays" :placeholder="todoRepeatKind === 'Weekly' ? '0,2,4' : '1,15'" />
           <button class="primary" type="submit" :disabled="ui.isBusy('add-todo')">
             {{ ui.isBusy("add-todo") ? "Adding…" : "Add" }}
           </button>

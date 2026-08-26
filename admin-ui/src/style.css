@@ -165,6 +165,7 @@ h2 {
   display: inline-flex;
   align-items: center;
   gap: 8px;
+  min-height: 42px;
   padding: 9px 13px;
   border: 1px solid var(--line);
   background: var(--card);
@@ -238,7 +239,7 @@ h2 {
 .row {
   display: flex;
   gap: 10px;
-  align-items: center;
+  align-items: flex-end;
   flex-wrap: wrap;
 }
 
@@ -247,8 +248,8 @@ h2 {
   gap: 10px;
 }
 
-.grow {
-  flex: 1;
+.row > .grow {
+  flex: 2 1 auto;
   min-width: 150px;
 }
 
@@ -260,11 +261,41 @@ button {
   background: var(--card);
   color: var(--ink);
   min-height: 42px;
+  /* 15px x 1.5 line + padding + border would exceed 42px; keep the single-line
+     controls exactly at the shared height. */
+  line-height: 1;
 }
 
 input,
 select {
   width: 100%;
+}
+
+/* Fields inside .row keep their natural width, then grow to fill the line and
+   wrap onto further lines as the viewport narrows. */
+.row > input,
+.row > select,
+.row > label {
+  width: auto;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* Custom chevron: the native select arrow hugs the right border and ignores
+   padding, so it is replaced with a background image at the text inset. */
+select {
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%231e1f1a' stroke-width='1.5'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  padding-right: 30px;
+}
+
+/* Chrome's date control ignores line-height and is intrinsically ~46px tall;
+   pin it to the common control height so rows stay aligned. */
+input[type="date"] {
+  height: 42px;
+  line-height: normal;
 }
 
 input:focus,
@@ -277,6 +308,10 @@ summary:focus,
 }
 
 button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 12px;
   cursor: pointer;
   font-weight: 800;
   white-space: nowrap;
@@ -854,14 +889,18 @@ code {
     align-items: flex-start;
     flex-direction: column;
   }
+  .row > input,
+  .row > select,
+  .row > .grow,
+  .row > label,
+  .row > button {
+    flex: 1 1 140px;
+  }
   h1 {
     font-size: 36px;
   }
   .card {
     padding: 17px;
-  }
-  .row > * {
-    flex: 1 1 140px;
   }
   .userbar {
     width: 100%;
