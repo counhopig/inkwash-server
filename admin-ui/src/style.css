@@ -170,7 +170,6 @@ h2 {
   border: 1px solid var(--line);
   background: var(--card);
   white-space: nowrap;
-  font-size: 13px;
   font-weight: 800;
   letter-spacing: 0.04em;
   text-transform: uppercase;
