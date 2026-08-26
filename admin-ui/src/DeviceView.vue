@@ -356,26 +356,20 @@ watch(() => props.device.id, loadContent);
           <span class="count">{{ alarms.length }}</span>
         </div>
         <div class="row">
-          <label>Hour<input v-model.number="alarmHour" type="number" min="0" max="23" :disabled="ui.isBusy('add-alarm')" /></label>
-          <label>Minute<input v-model.number="alarmMinute" type="number" min="0" max="59" :disabled="ui.isBusy('add-alarm')" /></label>
-          <label class="grow">Label<input v-model="alarmLabel" placeholder="Wake up" :disabled="ui.isBusy('add-alarm')" /></label>
+          <input v-model.number="alarmHour" type="number" min="0" max="23" placeholder="HH" title="Hour" :disabled="ui.isBusy('add-alarm')" />
+          <input v-model.number="alarmMinute" type="number" min="0" max="59" placeholder="MM" title="Minute" :disabled="ui.isBusy('add-alarm')" />
+          <input v-model="alarmLabel" class="grow" placeholder="Label" :disabled="ui.isBusy('add-alarm')" />
+          <select v-model="alarmRepeatKind" title="Repeat" :disabled="ui.isBusy('add-alarm')">
+            <option value="Daily">Daily</option>
+            <option value="Weekly">Weekly</option>
+            <option value="Monthly">Monthly</option>
+            <option value="Once">Once</option>
+          </select>
+          <input v-if="alarmRepeatKind === 'Weekly' || alarmRepeatKind === 'Monthly'" v-model="alarmRepeatDays" :placeholder="alarmRepeatKind === 'Weekly' ? '0,2,4 (0=Sun)' : '1,15'" title="Days" />
+          <input v-if="alarmRepeatKind === 'Once'" v-model="alarmOnceDate" type="date" title="Date" />
           <button class="primary" type="submit" :disabled="ui.isBusy('add-alarm')">
             {{ ui.isBusy("add-alarm") ? "Adding…" : "Add" }}
           </button>
-        </div>
-        <div class="row" style="margin-top: 8px">
-          <label>Repeat
-            <select v-model="alarmRepeatKind">
-              <option value="Daily">Daily</option>
-              <option value="Weekly">Weekly</option>
-              <option value="Monthly">Monthly</option>
-              <option value="Once">Once</option>
-            </select>
-          </label>
-          <label v-if="alarmRepeatKind === 'Weekly' || alarmRepeatKind === 'Monthly'">Days (comma-sep)
-            <input v-model="alarmRepeatDays" :placeholder="alarmRepeatKind === 'Weekly' ? '0,2,4 (0=Sun)' : '1,15'" />
-          </label>
-          <label v-if="alarmRepeatKind === 'Once'">Date<input v-model="alarmOnceDate" type="date" /></label>
         </div>
         <div class="list">
           <div v-if="alarms.length === 0" class="empty">No alarms scheduled</div>
