@@ -20,6 +20,15 @@ fn main() {
         );
     }
 
+    // The ts-rs bindings regeneration path (`npm run codegen` in admin-ui/)
+    // runs `cargo test` while the committed generated/*.ts may be stale or
+    // broken by in-progress DTO edits - exactly when vue-tsc would fail and
+    // panic this build script before the export tests can run. Skip the UI
+    // build there; every other cargo invocation still builds the UI.
+    if std::env::var_os("INKWASH_SKIP_UI_BUILD").is_some() {
+        return;
+    }
+
     let status = Command::new("npm")
         .args(["run", "build"])
         .current_dir("admin-ui")

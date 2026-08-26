@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --port 5173",
+    "codegen": "cd .. && INKWASH_SKIP_UI_BUILD=1 cargo test --quiet export_bindings",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview"
   },
