@@ -2,8 +2,9 @@
 
 Personal-scale cloud backend for the **Zectrix Note 4** e-ink device —
 stores alarms and todos per device and serves them over the sync contract.
-One half of the [**Inkwash**](https://github.com/counhopig/inkwash-firmware)
-ecosystem, alongside a PC tool and the device firmware.
+Part of the [**Inkwash**](https://github.com/counhopig/inkwash-firmware)
+ecosystem, alongside the device firmware, a PC tool and an MCP server for
+agents.
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-edition%202021-orange.svg)](Cargo.toml)
@@ -24,6 +25,7 @@ flowchart LR
     S -->|"JSON alarms + todos"| D
     T["inkwash-desktop"] -->|"HTTPS admin API (ADMIN_TOKEN)"| S
     U["Browser"] -->|"login /api/auth/* (session or ADMIN_TOKEN)"| S
+    A["agents / scripts<br/>opencode, Claude Code, Codex"] -->|"webhook (channel token)"| S
 ```
 
 ## Run
@@ -125,9 +127,16 @@ The embedded UI is a small Vue 3 app split into layered views (no router):
 ## Tests
 
 ```bash
-cargo test          # 2 unit tests (DB schema + device-state merge)
+cargo test          # 19 tests: db CRUD/transactions, auth dispatch, sync
+                    # merge, and the sync wire-contract fixtures
 cd admin-ui && npm run build   # vue-tsc type check + vite build
 ```
+
+`.github/workflows/ci.yml` runs `cargo test` (plus the embedded admin-ui
+build) on every push/PR. `scripts/check-logic-pin.sh` reports when the
+pinned `inkwash-logic` revision (Cargo.toml) falls behind the firmware
+repo's `logic/` HEAD; the wire-contract tests in `src/models.rs` fail if
+the pinned shapes drift from `docs/sync-api.md`.
 
 Exercised end-to-end against the physical device via `inkwash-desktop`.
 
