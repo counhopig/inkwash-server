@@ -14,9 +14,24 @@ fn main() {
     println!("cargo:rerun-if-changed=admin-ui/vite.config.ts");
 
     if !Path::new("admin-ui/node_modules").exists() {
+        // Distinguish "Node/npm not installed at all" from "deps not yet
+        // installed" so a fresh-clone `cargo build` fails with an actionable
+        // message instead of a bare missing-directory panic.
+        let npm_available = Command::new("npm")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !npm_available {
+            panic!(
+                "admin-ui/node_modules is missing and `npm` is not on PATH - install Node.js \
+                 (e.g. `brew install node`), then run `npm install --prefix admin-ui` once \
+                 before building"
+            );
+        }
         panic!(
-            "admin-ui/node_modules is missing - run `npm install` in admin-ui/ once before building \
-             (requires Node.js/npm)"
+            "admin-ui/node_modules is missing - run `npm install --prefix admin-ui` once before \
+             building (scripts/start.sh and scripts/build.sh do this automatically)"
         );
     }
 
