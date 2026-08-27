@@ -3,7 +3,31 @@
 All notable changes to **inkwash-server** are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [0.5.0] - 2026-08-27
+
+### Changed
+- **Version aligned to 0.5.0** across the four Inkwash repositories.
+- **inkwash-logic bumped to firmware HEAD** (`0ba5958`) - the commits
+  since the old pin are pure refactors and additions; the sync wire
+  contract is unchanged (locked by the new contract fixture tests).
+- **Removed the blanket permissive CORS layer** - every real client is
+  same-origin (embedded console / Vite dev proxy) or non-browser
+  (firmware, desktop reqwest, webhook POSTs), so CORS only widened
+  browser attack surface.
+
+### Added
+- **Sync wire-contract tests** (`models::wire_contract_tests`) - freeze
+  the `docs/sync-api.md` response shape and round-trip the server's
+  serialized output through the firmware's `SyncResponse` types, so
+  contract drift fails CI instead of surfacing as a silent device.
+- **`scripts/check-logic-pin.sh`** - reports when the pinned
+  inkwash-logic rev is behind the firmware repo's `logic/` HEAD.
+- **CI workflow** - `cargo test` (plus the embedded admin-ui build) on
+  push/PR.
+
+### Fixed
+- `build.rs` distinguishes a missing Node.js from missing admin-ui
+  dependencies and points at `scripts/start.sh` for the one-time setup.
 
 ## [0.4.0] - 2026-08-21
 
