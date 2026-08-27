@@ -256,3 +256,159 @@ pub struct InboxAccepted {
     pub accepted: bool,
     pub id: u64,
 }
+
+#[cfg(test)]
+mod wire_contract_tests {
+    //! Cross-repo guardrail for the sync wire contract (`docs/sync-api.md`
+    //! in the firmware repo). The firmware deserializes this crate's
+    //! serialized `SyncResponse` into the *same* `inkwash-logic` types the
+    //! server's own DTOs wrap, so drift shows up as a parse/field failure
+    //! here - in CI, on both repos - instead of as a device that silently
+    //! stops syncing. These tests freeze the documented contract shape, so
+    //! they must be updated (and the docs/schema bumped together) whenever
+    //! the contract intentionally changes.
+
+    use super::*;
+    use inkwash_logic::sync_validate::SyncResponse as LogicSyncResponse;
+
+    /// The canonical 200 OK body from `docs/sync-api.md` (alarms + todos),
+    /// plus an inbox item exercising every documented field.
+    const SYNC_API_EXAMPLE: &str = r#"{
+        "alarms": [
+            { "id": 0, "hour": 7, "minute": 30, "repeat": "Daily", "enabled": true, "label": "Morning" },
+            { "id": 1, "hour": 22, "minute": 0, "repeat": { "Once": { "year": 2026, "month": 12, "day": 25 } }, "enabled": true, "label": "Christmas alarm" },
+            { "id": 2, "hour": 9, "minute": 0, "repeat": { "Weekly": { "days": [0, 2, 4] } }, "enabled": true, "label": "Gym" }
+        ],
+        "todos": [
+            { "id": 0, "text": "Buy groceries", "done": false, "importance": "medium", "due_date": null, "repeat": null },
+            { "id": 1, "text": "Call home", "done": true, "importance": "high", "due_date": { "year": 2026, "month": 8, "day": 19 }, "repeat": { "Monthly": { "days": [1, 15] } } }
+        ],
+        "inbox": [
+            { "id": 41, "kind": "alert", "priority": "high", "title": "Build failed", "body": "CI on main is red", "when": 1785272400, "read": false }
+        ],
+        "inbox_read_acked": [1, 2],
+        "inbox_truncated": false
+    }"#;
+
+    #[test]
+    fn doc_example_parses_into_firmware_sync_response() {
+        let parsed: LogicSyncResponse =
+            serde_json::from_str(SYNC_API_EXAMPLE).expect("sync-api.md example must parse");
+
+        assert_eq!(parsed.alarms.len(), 3);
+        assert_eq!(parsed.alarms[0].id, 0);
+        assert_eq!(parsed.alarms[0].hour, 7);
+        assert_eq!(parsed.alarms[0].minute, 30);
+        assert!(matches!(parsed.alarms[0].repeat, Repeat::Daily));
+        assert!(parsed.alarms[0].enabled);
+        assert_eq!(parsed.alarms[0].label, "Morning");
+        assert!(matches!(
+            parsed.alarms[1].repeat,
+            Repeat::Once { year: 2026, month: 12, day: 25 }
+        ));
+        assert!(matches!(
+            parsed.alarms[2].repeat,
+            Repeat::Weekly { .. }
+        ));
+        if let Repeat::Weekly { days } = &parsed.alarms[2].repeat {
+            assert_eq!(days, &vec![0u8, 2, 4]);
+        }
+
+        assert_eq!(parsed.todos.len(), 2);
+        assert_eq!(parsed.todos[0].text, "Buy groceries");
+        assert!(!parsed.todos[0].done);
+        assert_eq!(parsed.todos[0].importance, Importance::Medium);
+        assert!(parsed.todos[0].due_date.is_none());
+        assert!(parsed.todos[0].repeat.is_none());
+        assert!(parsed.todos[1].done);
+        assert_eq!(parsed.todos[1].importance, Importance::High);
+        assert_eq!(parsed.todos[1].due_date, Some(TodoDue { year: 2026, month: 8, day: 19 }));
+        assert!(matches!(
+            parsed.todos[1].repeat,
+            Some(Repeat::Monthly { .. })
+        ));
+        if let Some(Repeat::Monthly { days }) = &parsed.todos[1].repeat {
+            assert_eq!(days, &vec![1u8, 15]);
+        }
+
+        assert_eq!(parsed.inbox.len(), 1);
+        assert_eq!(parsed.inbox[0].id, 41);
+        assert!(matches!(parsed.inbox[0].kind, InboxKind::Alert));
+        assert!(matches!(parsed.inbox[0].priority, Priority::High));
+        assert_eq!(parsed.inbox[0].title, "Build failed");
+        assert_eq!(parsed.inbox[0].body, "CI on main is red");
+        assert_eq!(parsed.inbox[0].when, Some(1785272400));
+        assert!(!parsed.inbox[0].read);
+
+        assert_eq!(parsed.inbox_read_acked, vec![1u64, 2]);
+        assert!(!parsed.inbox_truncated);
+    }
+
+    #[test]
+    fn server_sync_response_roundtrips_into_firmware_sync_response() {
+        // Whatever the server serializes must deserialize on the firmware
+        // side (the same inkwash-logic types) with every documented field
+        // intact - this is the direction a server-side DTO edit can break.
+        let server_view = SyncResponse {
+            alarms: vec![Alarm {
+                id: 3,
+                hour: 6,
+                minute: 45,
+                repeat: Repeat::Daily,
+                enabled: true,
+                label: "Workout".into(),
+            }],
+            todos: vec![Todo {
+                id: 7,
+                text: "Ship the release".into(),
+                done: false,
+                importance: Importance::High,
+                due_date: None,
+                repeat: None,
+            }],
+            inbox: vec![InboxItem {
+                id: 9,
+                kind: InboxKind::Info,
+                priority: Priority::Normal,
+                title: "Deploy finished".into(),
+                body: String::new(),
+                when: None,
+                read: true,
+            }],
+            inbox_read_acked: vec![4, 5],
+            inbox_truncated: true,
+        };
+
+        let serialized = serde_json::to_value(&server_view).expect("server SyncResponse must serialize");
+        let parsed: LogicSyncResponse =
+            serde_json::from_value(serialized.clone()).expect("server output must parse as firmware SyncResponse");
+
+        assert_eq!(parsed.alarms.len(), 1);
+        assert_eq!(parsed.alarms[0].id, 3);
+        assert_eq!(parsed.alarms[0].hour, 6);
+        assert_eq!(parsed.alarms[0].minute, 45);
+        assert!(matches!(parsed.alarms[0].repeat, Repeat::Daily));
+        assert!(parsed.alarms[0].enabled);
+        assert_eq!(parsed.alarms[0].label, "Workout");
+        assert_eq!(parsed.todos[0].id, 7);
+        assert_eq!(parsed.todos[0].text, "Ship the release");
+        assert_eq!(parsed.todos[0].importance, Importance::High);
+        assert_eq!(parsed.inbox[0].id, 9);
+        assert!(matches!(parsed.inbox[0].kind, InboxKind::Info));
+        assert_eq!(parsed.inbox[0].when, None);
+        assert!(parsed.inbox[0].read);
+        assert_eq!(parsed.inbox_read_acked, vec![4u64, 5]);
+        assert!(parsed.inbox_truncated);
+
+        // Documented top-level keys must be present in the serialized form.
+        let obj = serialized.as_object().expect("sync response is an object");
+        for key in ["alarms", "todos", "inbox", "inbox_read_acked", "inbox_truncated"] {
+            assert!(obj.contains_key(key), "missing documented key {key}");
+        }
+        // Every serialized alarm carries the full documented field set.
+        let alarm_obj = obj["alarms"][0].as_object().unwrap();
+        for key in ["id", "hour", "minute", "repeat", "enabled", "label"] {
+            assert!(alarm_obj.contains_key(key), "alarm missing key {key}");
+        }
+    }
+}
