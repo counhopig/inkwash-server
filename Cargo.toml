@@ -13,7 +13,10 @@ dotenvy = "0.15"
 # doc comments in ../inkwash/logic/src/. Pinned to a specific commit for
 # reproducible builds; bump `rev` when inkwash-logic changes and this repo
 # wants the update.
-inkwash-logic = { git = "https://github.com/counhopig/inkwash-firmware", rev = "e96e0e78cfb64f589dc396fe3833c31af93f5c5c" }
+# scripts/check-logic-pin.sh reports when this pin is behind the firmware
+# repo's logic/ HEAD; the wire-contract fixture tests in src/models.rs
+# fail if the pinned shapes drift from docs/sync-api.md.
+inkwash-logic = { git = "https://github.com/counhopig/inkwash-firmware", rev = "0ba59585807dd5563bcb8c7ff9a948315f08f409" }
 rand = "0.8"
 rust-embed = { version = "8.12.0", features = ["mime-guess"] }
 serde = { version = "1", features = ["derive"] }

@@ -797,7 +797,7 @@ dependencies = [
 [[package]]
 name = "inkwash-logic"
 version = "0.1.0"
-source = "git+https://github.com/counhopig/inkwash-firmware?rev=e96e0e78cfb64f589dc396fe3833c31af93f5c5c#e96e0e78cfb64f589dc396fe3833c31af93f5c5c"
+source = "git+https://github.com/counhopig/inkwash-firmware?rev=0ba59585807dd5563bcb8c7ff9a948315f08f409#0ba59585807dd5563bcb8c7ff9a948315f08f409"
 dependencies = [
  "serde",
  "serde_json",
