@@ -15,10 +15,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # macOS builds run on Apple Silicon only: GitHub retired its
+          # Intel macOS runners (macos-13), so an x86_64 macOS job would
+          # sit queued forever. Intel-Mac users build from source.
           - os: ubuntu-latest
             artifact: inkwash-server-linux-x86_64
-          - os: macos-13
-            artifact: inkwash-server-macos-x86_64
           - os: macos-14
             artifact: inkwash-server-macos-arm64
     runs-on: ${{ matrix.os }}

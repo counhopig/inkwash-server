@@ -10,7 +10,7 @@ Personal-scale device-cloud backend in Rust + axum: an admin API guarded by the 
   - Server-local DTOs in `models.rs` also carry ts-rs `#[derive(TS)]`: any `cargo test` run regenerates `admin-ui/src/lib/generated/*.ts`, and `admin-ui/src/lib/types.ts` re-exports them - commit refreshed files together with the model change (types mirroring the git-pinned `inkwash-logic` crate stay handwritten there). For breaking DTO edits use `npm run codegen` inside `admin-ui/` - it sets `INKWASH_SKIP_UI_BUILD=1` so build.rs skips the vue-tsc pass that would otherwise fail against the stale committed bindings before the export tests can run.
 
 ## Releases
-`.github/workflows/release.yml` builds Linux x86_64 + macOS x86_64/arm64 binaries and **publishes automatically** (`draft: false`) whenever a `v*` tag is pushed to the `github` remote — no manual draft handling.
+`.github/workflows/release.yml` builds Linux x86_64 + macOS arm64 binaries (GitHub retired the Intel macOS runners, so there is no macOS x86_64 artifact — Intel-Mac users build from source) and **publishes automatically** (`draft: false`) whenever a `v*` tag is pushed to the `github` remote — no manual draft handling.
 
 - **Critical:** GitHub Actions runs the workflow file **at the tagged commit**, not at `main`. If you re-trigger a release by deleting + re-pushing a tag, the tag must point to a commit that already contains the latest workflow changes — otherwise the *old* workflow runs. Also delete the old release + remote tag first, because force-updating an existing tag does not reliably re-trigger the workflow:
   ```bash
