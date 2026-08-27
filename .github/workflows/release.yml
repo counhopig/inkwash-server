@@ -17,8 +17,10 @@ jobs:
         include:
           - os: ubuntu-latest
             artifact: inkwash-server-linux-x86_64
-          - os: macos-latest
+          - os: macos-13
             artifact: inkwash-server-macos-x86_64
+          - os: macos-14
+            artifact: inkwash-server-macos-arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
