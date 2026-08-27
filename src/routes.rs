@@ -366,7 +366,7 @@ pub async fn authenticate(
         return Err((StatusCode::UNAUTHORIZED, "missing or invalid credentials"));
     };
     // Admin token: constant-time comparison so a wrong token's reject path
-    // doesn't finish measurably earlier than a right one's (T-014).
+    // doesn't finish measurably earlier than a right one's.
     if bool::from(state.admin_token.as_bytes().ct_eq(token.as_bytes())) {
         return Ok(AuthSubject::Admin);
     }

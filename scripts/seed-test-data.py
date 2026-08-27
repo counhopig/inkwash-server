@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Seed a local inkwash-server SQLite database with bulk alarms / todos /
-inbox for the T-056 large-data hardware verification (pagination,
+inbox for large-data hardware verification (pagination,
 truncation, NVS capacity, e-paper ghosting).
 
 Usage:

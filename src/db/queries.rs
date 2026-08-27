@@ -43,7 +43,7 @@ fn now_unix() -> i64 {
 /// None` creates an unowned device (only reachable with the `ADMIN_TOKEN`);
 /// `Some` ties the device to a console account.
 ///
-/// ## Token storage decision (2026-08-25, T-015)
+/// ## Token storage decision (2026-08-25)
 /// Device and session tokens are stored **plaintext**, unlike webhook
 /// channel tokens (Argon2id-hashed in `create_channel`). Deliberate:
 /// - A device/session token is a 48-char CSPRNG string with ~288 bits of
@@ -147,7 +147,7 @@ pub async fn delete_device(db: &Db, device_id: &str) -> Result<()> {
 
 /// Looks up the device owning `token`, returning `(device_id, version)`.
 /// Plaintext lookup by design - see `register_device`'s "Token storage
-/// decision" comment (T-015).
+/// decision" comment.
 pub async fn find_device_by_token(db: &Db, token: &str) -> Result<Option<(String, i64)>> {
     let row = sqlx::query(db.sql(
         "SELECT id, version FROM devices WHERE token = ?",
@@ -277,7 +277,7 @@ where
 /// Creates a new alarm (`id: None`) or replaces an existing one (`id:
 /// Some`) for `device_id`, and returns the alarm's id. Bumps the device's
 /// sync version in the same transaction so a failed write can't leave a
-/// phantom version bump behind (T-026).
+/// phantom version bump behind.
 pub async fn upsert_alarm(
     db: &Db,
     device_id: &str,
@@ -543,7 +543,7 @@ pub async fn delete_account(db: &Db, account_id: i64) -> Result<bool> {
 
 /// Creates a session for `account_id` and returns its bearer token.
 /// Stored plaintext by design - see `register_device`'s "Token storage
-/// decision" comment (T-015): sessions are 48-char CSPRNG, revocable via
+/// decision" comment: sessions are 48-char CSPRNG, revocable via
 /// `delete_session`, and hashing would turn the `WHERE token = ?` lookup
 /// into an all-rows scan.
 pub async fn create_session(db: &Db, account_id: i64) -> Result<String> {
