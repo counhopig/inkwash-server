@@ -6,7 +6,6 @@ mod routes;
 use std::net::SocketAddr;
 
 use anyhow::Context;
-use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 #[tokio::main]
@@ -44,9 +43,15 @@ async fn main() -> anyhow::Result<()> {
 
     let db = db::open(&db_url, 2).await?;
     let state = routes::AppState { db, admin_token };
-    let app = routes::router(state)
-        .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive());
+
+    // Deliberately no CORS layer. Every legitimate client is either
+    // same-origin (the embedded admin console, including its Vite dev
+    // proxy - see admin-ui/vite.config.ts) or non-browser (firmware,
+    // inkwash-desktop's reqwest client, webhook/agent POSTs), and neither
+    // kind is affected by CORS. The old blanket `CorsLayer::permissive()`
+    // only widened browser attack surface for no working cross-origin
+    // client, so it was removed rather than narrowed.
+    let app = routes::router(state).layer(TraceLayer::new_for_http());
 
     tracing::info!("inkwash-server listening on {bind_addr}, db={db_kind}");
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
